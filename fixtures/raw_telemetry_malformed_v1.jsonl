@@ -1,0 +1,7 @@
+{"schema_version":"v1","raw_event_id":"RAW-SYS-OK-01","source_event_id":"REC-101","source_format":"sysmon","source_timestamp":"2026-10-12T10:00:00Z","ingested_at":"2026-10-12T10:00:10Z","raw_payload":{"EventID":1,"Computer":"HOST-A"}}
+
+{"corrupted_json_string": true, missing_closing_bracket: 
+
+{"schema_version":"v1","raw_event_id":"RAW-SYS-OK-02","source_event_id":"REC-102","source_format":"sysmon","source_timestamp":"2026-10-12T10:01:00Z","ingested_at":"2026-10-12T10:01:10Z","raw_payload":{"EventID":1,"Computer":"HOST-B"}}
+{"schema_version":"v1","raw_event_id":"RAW-ERR-03","source_format":"sysmon","source_timestamp":"2026-10-12T10:02:00Z","ingested_at":"2026-10-12T10:02:10Z","raw_payload":{"EventID":1}}
+{"schema_version":"v1","raw_event_id":"RAW-ERR-04","source_event_id":"REC-104","source_format":"sysmon","source_timestamp":"not-a-valid-datetime","ingested_at":"2026-10-12T10:03:10Z","raw_payload":{"EventID":1}}
