@@ -663,8 +663,8 @@ def test_bm25_causal_confounding_resolution_under_strict_attribution(base_setup)
     """
     store, scn, rule, t0 = base_setup
 
-    attack_token = "TOK-ATTACK-PID4001"
-    bg_admin_token = "TOK-BG-ADMIN-PID9999"
+    attack_token = "TOK-ATK-01"
+    bg_admin_token = "TOK-BG-02"
 
     run_25 = TestRunV1(
         run_id="RUN-BM-25-EXPERIMENT",
@@ -879,3 +879,508 @@ def test_api_strict_attribution_query_param(base_setup):
     assert data_strict["metadata"]["attribution"]["strict_attribution"] is True
     assert data_strict["metadata"]["attribution"]["status"] == "VERIFIED"
     assert data_strict["metadata"]["attribution"]["cryptographic_proof"] is False
+
+
+# ── 7. Phase 2.9 Regression Tests: Attribution Defect Verification ───────────
+
+
+def test_strict_attribution_matching_alert_with_coexisting_untokenized_alert(base_setup):
+    """Defect 1: In strict mode, matching alert in execution window must yield PASS
+
+    even if an unrelated untokenized alert also exists within the same execution window.
+    """
+    store, scn, rule, t0 = base_setup
+    tok = "TOK-PASS-01"
+
+    run = TestRunV1(
+        run_id="RUN-DEFECT1",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token=tok,
+    )
+    store.add_run(run)
+
+    norm_ev = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-DEF1",
+        raw_event_id="RAW-DEF1",
+        source_event_id="SRC-DEF1",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=tok,
+    )
+    store.add_normalized_event(norm_ev)
+
+    # Coexisting alert 1: Genuine detection with matching token
+    alert_matching = AlertV1(
+        alert_id="ALT-MATCHING",
+        source_alert_id="SRC-MATCH",
+        source_type="sigma",
+        alert_timestamp=t0 + timedelta(minutes=3),
+        host_id=run.target_host,
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token=tok,
+    )
+    # Coexisting alert 2: Untokenized background alert in same window
+    alert_untokenized = AlertV1(
+        alert_id="ALT-UNTOKENIZED",
+        source_alert_id="SRC-UNTOK",
+        source_type="sigma",
+        alert_timestamp=t0 + timedelta(minutes=4),
+        host_id=run.target_host,
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token=None,
+    )
+    store.add_alert(alert_matching)
+    store.add_alert(alert_untokenized)
+
+    engine = AssuranceEngine(store)
+    res = engine.evaluate_run(run.run_id, strict_attribution=True)
+
+    # Must be PASS: matching alert verified, untokenized alert does not block
+    assert res.predicted_category == DiagnosticCategory.PASS
+    assert "ALT-MATCHING" in res.supporting_evidence_ids
+    assert res.metadata["attribution"]["status"] == AttributionStatus.VERIFIED.value
+
+
+def test_strict_attribution_matching_telemetry_with_coexisting_untokenized_event(base_setup):
+    """Defect 2: Matching-token telemetry event must not be rejected solely
+
+    because an unrelated untokenized telemetry event also exists on the host.
+    """
+    store, scn, rule, t0 = base_setup
+    tok = "TOK-TEL-01"
+
+    run = TestRunV1(
+        run_id="RUN-DEFECT2",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token=tok,
+    )
+    store.add_run(run)
+
+    # Event 1: Genuine test attack with matching token
+    norm_matching = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-MATCHING",
+        raw_event_id="RAW-MATCH",
+        source_event_id="SRC-MATCH",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=tok,
+    )
+    # Event 2: Background powershell process without execution token
+    norm_untokenized = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-UNTOKENIZED",
+        raw_event_id="RAW-UNTOK",
+        source_event_id="SRC-UNTOK",
+        source_timestamp=t0 + timedelta(minutes=1),
+        normalized_timestamp=t0 + timedelta(minutes=1),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -NoProfile",
+        execution_token=None,
+    )
+    store.add_normalized_event(norm_matching)
+    store.add_normalized_event(norm_untokenized)
+
+    alert = AlertV1(
+        alert_id="ALT-TEL-PASS",
+        source_alert_id="SRC-TEL-PASS",
+        source_type="sigma",
+        alert_timestamp=t0 + timedelta(minutes=3),
+        host_id=run.target_host,
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token=tok,
+    )
+    store.add_alert(alert)
+
+    engine = AssuranceEngine(store)
+    res = engine.evaluate_run(run.run_id, strict_attribution=True)
+
+    # Must be PASS: matching telemetry attributed, untokenized event does not cause rejection
+    assert res.predicted_category == DiagnosticCategory.PASS
+    assert "NORM-MATCHING" in res.supporting_evidence_ids
+    assert res.metadata["attribution"]["status"] == AttributionStatus.VERIFIED.value
+
+
+def test_historical_untimestamped_alerts_do_not_block_future_runs(base_setup):
+    """Defect 3: An untimestamped alert ingested 24 hours ago must not permanently
+
+    force future runs on the same rule/host into INCONCLUSIVE.
+    """
+    store, scn, rule, t0 = base_setup
+    tok = "TOK-HIST-01"
+
+    # Add historical alert ingested 24 hours prior without event timestamp
+    t_historical = t0 - timedelta(hours=24)
+    old_alert = AlertV1(
+        alert_id="ALT-HIST-NO-TS",
+        source_alert_id="SRC-HIST-OLD",
+        source_type="wazuh",
+        alert_timestamp=None,
+        ingested_at=t_historical,
+        host_id="WS-TARGET-01",
+        rule_reference=scn.expected_detection_rule_id,
+    )
+    store.add_alert(old_alert)
+
+    # Today's run at t0 where rule was silent (did not fire)
+    run_today = TestRunV1(
+        run_id="RUN-TODAY-SILENT",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token=tok,
+    )
+    store.add_run(run_today)
+
+    norm_ev = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-TODAY",
+        raw_event_id="RAW-TODAY",
+        source_event_id="SRC-TODAY",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run_today.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=tok,
+    )
+    store.add_normalized_event(norm_ev)
+
+    engine = AssuranceEngine(store)
+    # Both default mode and strict mode must exclude the historical alert and diagnose rule silence
+    res_default = engine.evaluate_run(run_today.run_id, strict_attribution=False)
+    assert res_default.predicted_category == DiagnosticCategory.DETECTION_NOT_TRIGGERED
+
+    res_strict = engine.evaluate_run(run_today.run_id, strict_attribution=True)
+    assert res_strict.predicted_category == DiagnosticCategory.DETECTION_NOT_TRIGGERED
+
+
+def test_strict_attribution_telemetry_conflict_takes_precedence_over_matching(base_setup):
+    """When a candidate telemetry event carries CONFLICT token alongside a matching event,
+
+    conflict detection must take precedence and return INCONCLUSIVE.
+    """
+    store, scn, rule, t0 = base_setup
+    tok = "TOK-CONF-01"
+
+    run = TestRunV1(
+        run_id="RUN-CONFLICT-TEST",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token=tok,
+    )
+    store.add_run(run)
+
+    norm_good = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-GOOD",
+        raw_event_id="RAW-GOOD",
+        source_event_id="SRC-GOOD",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=tok,
+    )
+    norm_conflict = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-CONFLICT",
+        raw_event_id="RAW-CONF",
+        source_event_id="SRC-CONF",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token="CONFLICT",
+    )
+    store.add_normalized_event(norm_good)
+    store.add_normalized_event(norm_conflict)
+
+    engine = AssuranceEngine(store)
+    res = engine.evaluate_run(run.run_id, strict_attribution=True)
+    assert res.predicted_category == DiagnosticCategory.INCONCLUSIVE
+    assert res.metadata["attribution"]["status"] == AttributionStatus.CONFLICT.value
+
+
+def test_strict_attribution_grace_window_alert_with_untokenized_window_alert(base_setup):
+    """A matching token alert inside the grace window (outside execution window)
+
+    must never produce PASS, even when an untokenized alert is present in the execution window.
+    """
+    store, scn, rule, t0 = base_setup
+    tok = "TOK-GRACE-01"
+
+    run = TestRunV1(
+        run_id="RUN-GRACE-UNTOK",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token=tok,
+    )
+    store.add_run(run)
+
+    norm_ev = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-GRACE-EV",
+        raw_event_id="RAW-G1",
+        source_event_id="SRC-G1",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=tok,
+    )
+    store.add_normalized_event(norm_ev)
+
+    # Untokenized alert in execution window
+    alert_untok = AlertV1(
+        alert_id="ALT-UNTOK-WIN",
+        source_alert_id="SRC-UW",
+        source_type="sigma",
+        alert_timestamp=t0 + timedelta(minutes=3),
+        host_id=run.target_host,
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token=None,
+    )
+    # Alert with matching token arrives 20 minutes late (in grace period)
+    late_alert = AlertV1(
+        alert_id="ALT-GRACE-MATCH",
+        source_alert_id="SRC-GM",
+        source_type="sigma",
+        alert_timestamp=t0 + timedelta(minutes=20),
+        host_id=run.target_host,
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token=tok,
+    )
+    store.add_alert(alert_untok)
+    store.add_alert(late_alert)
+
+    engine = AssuranceEngine(store)
+    res = engine.evaluate_run(run.run_id, strict_attribution=True)
+
+    # Must be ALERT_NOT_CORRELATED (PIPELINE_LATENCY), NEVER PASS
+    assert res.predicted_category == DiagnosticCategory.ALERT_NOT_CORRELATED
+    assert res.failure_category == FailureCategory.PIPELINE_LATENCY
+
+
+def test_default_mode_ignores_token_mismatch_and_preserves_spatio_temporal_correlation(base_setup):
+    """Default mode must preserve backward-compatible spatio-temporal correlation,
+
+    correlating alerts inside the execution window even if their execution tokens do not match.
+    """
+    store, scn, rule, t0 = base_setup
+    run_tok = "TOK-RUN-A"
+    diff_tok = "TOK-NOISE-B"
+
+    run = TestRunV1(
+        run_id="RUN-DEFAULT-COMPAT",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token=run_tok,
+    )
+    store.add_run(run)
+
+    norm_ev = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-DEF-COMPAT",
+        raw_event_id="RAW-DC1",
+        source_event_id="SRC-DC1",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=run_tok,
+    )
+    store.add_normalized_event(norm_ev)
+
+    # Alert in window has a different token (e.g. background noise)
+    alert = AlertV1(
+        alert_id="ALT-DEF-COMPAT",
+        source_alert_id="SRC-DC1",
+        source_type="sigma",
+        alert_timestamp=t0 + timedelta(minutes=3),
+        host_id=run.target_host,
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token=diff_tok,
+    )
+    store.add_alert(alert)
+
+    engine = AssuranceEngine(store)
+
+    # In default mode (strict_attribution=False): correlates via host & time window -> PASS
+    res_default = engine.evaluate_run(run.run_id, strict_attribution=False)
+    assert res_default.predicted_category == DiagnosticCategory.PASS
+    assert "ALT-DEF-COMPAT" in res_default.supporting_evidence_ids
+    assert res_default.metadata["attribution"]["strict_attribution"] is False
+    assert res_default.metadata["attribution"]["status"] == AttributionStatus.MISMATCHED.value
+
+    # In strict mode: rejects mismatched alert -> DETECTION_NOT_TRIGGERED
+    res_strict = engine.evaluate_run(run.run_id, strict_attribution=True)
+    assert res_strict.predicted_category == DiagnosticCategory.DETECTION_NOT_TRIGGERED
+    assert res_strict.metadata["attribution"]["strict_attribution"] is True
+
+
+def test_strict_attribution_matching_alert_on_wrong_host_not_correlated(base_setup):
+    """A matching-token alert routed to the wrong host must not produce PASS;
+
+    it must yield ALERT_NOT_CORRELATED with routing diagnosis and the alert as contradictory evidence.
+    """
+    store, scn, rule, t0 = base_setup
+    tok = "TOK-ROUTING-01"
+
+    run = TestRunV1(
+        run_id="RUN-WRONG-HOST",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token=tok,
+    )
+    store.add_run(run)
+
+    norm_ev = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-WH-01",
+        raw_event_id="RAW-WH-01",
+        source_event_id="SRC-WH-01",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=tok,
+    )
+    store.add_normalized_event(norm_ev)
+
+    # Alert has matching token, but was routed to WS-WRONG-99 instead of WS-TARGET-01
+    alert_wrong_host = AlertV1(
+        alert_id="ALT-WRONG-HOST",
+        source_alert_id="SRC-WH",
+        source_type="sigma",
+        alert_timestamp=t0 + timedelta(minutes=3),
+        host_id="WS-WRONG-99",
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token=tok,
+    )
+    store.add_alert(alert_wrong_host)
+
+    engine = AssuranceEngine(store)
+    res = engine.evaluate_run(run.run_id, strict_attribution=True)
+
+    # Must NOT produce PASS; must be ALERT_NOT_CORRELATED
+    assert res.predicted_category == DiagnosticCategory.ALERT_NOT_CORRELATED
+    assert "ALT-WRONG-HOST" not in res.supporting_evidence_ids
+    assert "ALT-WRONG-HOST" in res.contradictory_evidence_ids
+    assert "NORM-WH-01" in res.supporting_evidence_ids
+    assert "mismatched host" in res.reason.lower() or "routed to host" in res.reason.lower()
+    assert res.metadata["attribution"]["status"] == AttributionStatus.VERIFIED.value
+    assert res.metadata["attribution"]["strict_attribution"] is True
+
+
+def test_undated_alert_without_token_does_not_make_run_inconclusive(base_setup):
+    """An alert lacking both alert_timestamp and ingested_at without the run's token
+
+    must not be silently treated as current and must not make an unrelated run INCONCLUSIVE.
+    """
+    store, scn, rule, t0 = base_setup
+    tok = "TOK-UNDATED-01"
+
+    # Add an alert with no timestamps and no token directly to store
+    undated_alert = AlertV1(
+        alert_id="ALT-UNDATED-NO-TOK",
+        source_alert_id="SRC-UNDATED",
+        source_type="wazuh",
+        alert_timestamp=None,
+        ingested_at=None,
+        host_id="WS-TARGET-01",
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token=None,
+    )
+    store.add_alert(undated_alert)
+    # Ensure ingested_at is explicitly None (override store default timestamp)
+    undated_alert.ingested_at = None
+
+    # Test run where expected detection rule was silent (did not trigger)
+    run = TestRunV1(
+        run_id="RUN-UNDATED-TEST",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token=tok,
+    )
+    store.add_run(run)
+
+    norm_ev = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-UNDATED-EV",
+        raw_event_id="RAW-UE1",
+        source_event_id="SRC-UE1",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=tok,
+    )
+    store.add_normalized_event(norm_ev)
+
+    engine = AssuranceEngine(store)
+
+    # In strict mode: undated untokenized alert must not force INCONCLUSIVE
+    res_strict = engine.evaluate_run(run.run_id, strict_attribution=True)
+    assert res_strict.predicted_category == DiagnosticCategory.DETECTION_NOT_TRIGGERED
+    assert res_strict.predicted_category != DiagnosticCategory.INCONCLUSIVE
+
+    # In default mode: undated alert must not force INCONCLUSIVE
+    res_default = engine.evaluate_run(run.run_id, strict_attribution=False)
+    assert res_default.predicted_category == DiagnosticCategory.DETECTION_NOT_TRIGGERED
+    assert res_default.predicted_category != DiagnosticCategory.INCONCLUSIVE
