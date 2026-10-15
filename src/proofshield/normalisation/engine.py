@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 import os
+import re
 from typing import Any, Dict, List, Optional, Sequence
 import uuid
 from dateutil import parser as date_parser
@@ -12,6 +13,110 @@ from proofshield.schemas.telemetry import (
     NormalizedTelemetryEventV1,
     RawTelemetryEventV1,
 )
+
+
+TOKEN_STRUCTURED_KEYS: Sequence[str] = (
+    "execution_token",
+    "executiontoken",
+    "execution_token_id",
+    "proofshield_token",
+    "proofshieldtoken",
+    "test_token",
+    "testtoken",
+    "run_token",
+    "runtoken",
+    "token",
+    "token_id",
+)
+
+TOKEN_UNSTRUCTURED_PATTERNS = [
+    # Flags: --execution-token=abc, --token abc, -token:abc, /execution_token:abc
+    re.compile(r'(?:--?|/)(?:execution[-_]token|proofshield[-_]token|test[-_]token|token)[=:\s]+(["\']?)([a-zA-Z0-9_\-\.]+)\1', re.IGNORECASE),
+    # Brackets: [TOKEN:abc], [EXECUTION_TOKEN:abc]
+    re.compile(r'\[(?:EXECUTION[-_]TOKEN|PROOFSHIELD[-_]TOKEN|TEST[-_]TOKEN|TOKEN)[:\s]+(["\']?)([a-zA-Z0-9_\-\.]+)\1\]', re.IGNORECASE),
+    # Key-value: execution_token=abc, token=abc, TOKEN:abc
+    re.compile(r'\b(?:execution[-_]token|proofshield[-_]token|test[-_]token|token)[=:\s]+(["\']?)([a-zA-Z0-9_\-\.]+)\1', re.IGNORECASE),
+    # Prefix: TOKEN=abc
+    re.compile(r'\bTOKEN=([a-zA-Z0-9_\-\.]+)', re.IGNORECASE),
+]
+
+_TOKEN_IGNORE_VALUES = {"none", "null", "nil", "undefined", "false", "true", "empty"}
+
+
+def extract_execution_token(
+    payload: Optional[Dict[str, Any]] = None,
+    explicit_token: Optional[str] = None,
+    text_fields: Optional[Sequence[Optional[str]]] = None,
+) -> Optional[str]:
+    """Extract an execution token prioritizing structured fields with conflict detection.
+
+    Rules:
+    1. If explicit_token or structured token is "CONFLICT", returns "CONFLICT".
+    2. Check structured fields in payload (case-insensitive keys). If explicit_token and
+       structured payload token both exist and differ, returns "CONFLICT".
+    3. Extract candidate tokens from unstructured text_fields via standard token patterns.
+       If multiple distinct tokens are found across text fields, returns "CONFLICT".
+    4. If structured token exists and extracted unstructured token exists:
+       - If they match, returns the structured token.
+       - If they conflict, returns "CONFLICT" (never verified).
+    5. If only structured token exists, returns it.
+    6. If only extracted unstructured token exists, returns it.
+    7. Otherwise, returns None.
+    """
+    if explicit_token is not None:
+        explicit_token = explicit_token.strip()
+        if explicit_token == "CONFLICT":
+            return "CONFLICT"
+
+    structured_token: Optional[str] = explicit_token
+    p = payload or {}
+
+    # Check structured payload keys
+    for k, v in p.items():
+        if k.strip().lower() in TOKEN_STRUCTURED_KEYS and v is not None:
+            val = str(v).strip()
+            if not val or val.lower() in _TOKEN_IGNORE_VALUES:
+                continue
+            if val == "CONFLICT":
+                return "CONFLICT"
+            if structured_token is not None and structured_token != val:
+                return "CONFLICT"
+            structured_token = val
+
+    # Check unstructured text fields
+    extracted_tokens: List[str] = []
+    if text_fields:
+        for text in text_fields:
+            if not text or not isinstance(text, str):
+                continue
+            for pattern in TOKEN_UNSTRUCTURED_PATTERNS:
+                for match in pattern.finditer(text):
+                    # group 2 for patterns with quotes group 1, or group 1 for TOKEN=...
+                    tok = match.group(2) if match.lastindex and match.lastindex >= 2 else match.group(1)
+                    if tok:
+                        tok_str = tok.strip()
+                        if tok_str and tok_str.lower() not in _TOKEN_IGNORE_VALUES:
+                            if tok_str not in extracted_tokens:
+                                extracted_tokens.append(tok_str)
+
+    if len(extracted_tokens) > 1:
+        # Multiple differing tokens in text fields -> conflict
+        return "CONFLICT"
+
+    unstructured_token = extracted_tokens[0] if extracted_tokens else None
+
+    if structured_token is not None and unstructured_token is not None:
+        if structured_token != unstructured_token:
+            return "CONFLICT"
+        return structured_token
+
+    if structured_token is not None:
+        return structured_token
+
+    if unstructured_token is not None:
+        return unstructured_token
+
+    return None
 
 
 def _ensure_utc(dt: datetime) -> datetime:
@@ -98,8 +203,12 @@ class SysmonNormaliser(BaseNormaliser):
             "EventID", "RecordId", "EventRecordID", "Computer", "host", "Host",
             "Image", "CommandLine", "ParentImage", "ParentCommandLine", "User",
             "Hashes", "Sha256", "DestinationIp", "DestinationPort", "UtcTime",
+            "execution_token", "ExecutionToken", "token", "Token", "proofshield_token",
         }
         extra = {k: v for k, v in p.items() if k not in known_keys}
+
+        # Token extraction (structured-first with conflict detection)
+        token = extract_execution_token(p, text_fields=[cmd_line, image_path])
 
         return NormalizedTelemetryEventV1(
             normalized_event_id=f"NORM-{uuid.uuid4().hex[:12].upper()}",
@@ -118,6 +227,7 @@ class SysmonNormaliser(BaseNormaliser):
             hashes=hashes,
             network_destination_ip=dest_ip,
             network_destination_port=dest_port,
+            execution_token=token,
             extra_attributes=extra,
         )
 
@@ -191,9 +301,11 @@ class GenericEDRNormaliser(BaseNormaliser):
             "cmdline", "command", "parent_process_name", "parent_name",
             "parent_command_line", "parent_cmdline", "hashes", "sha256", "md5",
             "sha1", "destination_ip", "dst_ip", "remote_ip", "destination_port",
-            "dst_port", "remote_port", "timestamp",
+            "dst_port", "remote_port", "timestamp", "execution_token", "token", "proofshield_token",
         }
         extra = {k: v for k, v in p.items() if k not in known_keys}
+
+        token = extract_execution_token(p, text_fields=[cmd_line, process_path])
 
         return NormalizedTelemetryEventV1(
             normalized_event_id=f"NORM-{uuid.uuid4().hex[:12].upper()}",
@@ -212,6 +324,7 @@ class GenericEDRNormaliser(BaseNormaliser):
             hashes=hashes,
             network_destination_ip=dest_ip,
             network_destination_port=dest_port,
+            execution_token=token,
             extra_attributes=extra,
         )
 
@@ -247,6 +360,8 @@ class FallbackNormaliser(BaseNormaliser):
         proc_name = find_val("process_name", "process", "image", "file_name")
         proc_path = find_val("process_path", "image_path", "path")
 
+        token = extract_execution_token(p, text_fields=[str(cmd_line) if cmd_line else None])
+
         return NormalizedTelemetryEventV1(
             normalized_event_id=f"NORM-{uuid.uuid4().hex[:12].upper()}",
             raw_event_id=raw_event.raw_event_id,
@@ -259,6 +374,7 @@ class FallbackNormaliser(BaseNormaliser):
             process_name=str(proc_name) if proc_name else None,
             process_path=str(proc_path) if proc_path else None,
             command_line=str(cmd_line) if cmd_line else None,
+            execution_token=token,
             extra_attributes=dict(p),
         )
 

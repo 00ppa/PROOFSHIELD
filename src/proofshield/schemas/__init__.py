@@ -12,6 +12,7 @@ Explicitly versioned data structures ensuring strict separation between:
 
 from proofshield.schemas.alert import AlertV1
 from proofshield.schemas.common import (
+    AttributionStatus,
     DiagnosticCategory,
     DiagnosticOutcome,
     EventCategory,
@@ -35,6 +36,7 @@ from proofshield.schemas.test_run import TestRunV1
 __all__ = [
     "SCHEMA_VERSION",
     "AlertV1",
+    "AttributionStatus",
     "DetectionRuleV1",
     "DiagnosticCategory",
     "DiagnosticOutcome",

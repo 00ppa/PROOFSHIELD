@@ -53,6 +53,10 @@ class TestRunV1(ProofshieldBaseModel):
         None,
         description="Cleanup status after test execution (pending, completed, skipped)",
     )
+    execution_token: Optional[str] = Field(
+        None,
+        description="Optional execution token for causal provenance and attribution",
+    )
     metadata: Dict[str, Any] = Field(
         default_factory=dict,
         description="Additional execution metadata (agent version, OS build, etc.)",

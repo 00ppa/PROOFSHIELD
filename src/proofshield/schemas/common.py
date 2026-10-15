@@ -61,6 +61,16 @@ class EventCategory(str, Enum):
     OTHER = "OTHER"
 
 
+class AttributionStatus(str, Enum):
+    """Provenance and token attribution status for test runs and evidence."""
+    VERIFIED = "VERIFIED"
+    UNATTRIBUTED = "UNATTRIBUTED"
+    CONFLICT = "CONFLICT"
+    MISMATCHED = "MISMATCHED"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    NOT_REQUESTED = "NOT_REQUESTED"
+
+
 class DiagnosticCategory(str, Enum):
     """Primary diagnostic classification per specification Section 6.
 

@@ -207,7 +207,13 @@ def get_ground_truth_for_run(run_id: str) -> GroundTruthV1:
     response_model=DiagnosticResultV1,
     summary="Trigger deterministic diagnostic evaluation of a test run",
 )
-def evaluate_test_run(run_id: str) -> DiagnosticResultV1:
+def evaluate_test_run(
+    run_id: str,
+    strict_attribution: Optional[bool] = Query(
+        None,
+        description="Opt-in strict token attribution requiring execution token provenance",
+    ),
+) -> DiagnosticResultV1:
     """Evaluate a test run against scenario expectations and telemetry evidence.
 
     Uses the deterministic Assurance Engine (Layer 5) to classify the outcome
@@ -217,7 +223,7 @@ def evaluate_test_run(run_id: str) -> DiagnosticResultV1:
     """
     store = get_store()
     engine = AssuranceEngine(store)
-    result = engine.evaluate_run(run_id)
+    result = engine.evaluate_run(run_id, strict_attribution=strict_attribution)
     store.add_result(result)
     return result
 

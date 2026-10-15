@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import ipaddress
 from typing import Dict, List, Optional, Union
 
+from proofshield.normalisation.engine import extract_execution_token
 from proofshield.schemas.alert import AlertV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
@@ -217,6 +218,15 @@ class InMemoryStore:
             alert.ingested_at = datetime.now(timezone.utc)
         if alert.alert_timestamp is None:
             alert.metadata["ingestion_time_only"] = True
+
+        # Structured-first token extraction / conflict verification on alert
+        token = extract_execution_token(
+            payload=alert.metadata,
+            explicit_token=alert.execution_token,
+            text_fields=[alert.alert_title],
+        )
+        alert.execution_token = token
+
         self._alerts[alert.alert_id] = alert
         return alert
 

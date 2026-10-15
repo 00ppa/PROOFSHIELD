@@ -58,6 +58,10 @@ class AlertV1(ProofshieldBaseModel):
         None,
         description="Reference to the original raw alert record",
     )
+    execution_token: Optional[str] = Field(
+        None,
+        description="Optional execution token for causal attribution",
+    )
     metadata: Dict[str, Any] = Field(
         default_factory=dict,
         description="Additional alert metadata and context",

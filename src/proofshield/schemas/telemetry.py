@@ -125,6 +125,10 @@ class NormalizedTelemetryEventV1(ProofshieldBaseModel):
         le=65535,
         description="Destination network port",
     )
+    execution_token: Optional[str] = Field(
+        None,
+        description="Optional execution token extracted from telemetry or provided for causal attribution",
+    )
     extra_attributes: Dict[str, Any] = Field(
         default_factory=dict,
         description="Preserved provider-specific attributes that do not map to canonical fields",
