@@ -38,6 +38,17 @@ def _is_in_window(ts: Optional[datetime], w_start: datetime, w_end: datetime) ->
     return w_start <= ts <= w_end
 
 
+def _is_before_window(ts: Optional[datetime], w_start: datetime) -> bool:
+    """Check if timestamp occurs strictly before w_start accounting for timezone differences."""
+    if ts is None:
+        return False
+    if ts.tzinfo is not None and w_start.tzinfo is None:
+        w_start = w_start.replace(tzinfo=ts.tzinfo)
+    elif ts.tzinfo is None and w_start.tzinfo is not None:
+        ts = ts.replace(tzinfo=w_start.tzinfo)
+    return ts < w_start
+
+
 class AssuranceEngine:
     """Deterministic diagnostic engine (Architecture Layer 5).
 
@@ -345,52 +356,58 @@ class AssuranceEngine:
                     },
                 )
 
-            if all(e.execution_token is None for e in matching_events):
-                return self._make_result(
-                    run=run,
-                    scenario=scenario,
-                    category=DiagnosticCategory.INCONCLUSIVE,
-                    reason=(
-                        "Matching telemetry events lack execution tokens required for strict attribution; "
-                        "missing evidence prevents causal linking"
-                    ),
-                    confidence="uncertain",
-                    supporting_evidence=[e.normalized_event_id for e in matching_events],
-                    metadata={
-                        "attribution": self._build_attribution_metadata(
-                            run_token=run_token,
-                            status=AttributionStatus.INCONCLUSIVE.value,
-                            is_strict=True,
-                            events=matching_events,
-                            notes=["Missing execution token on candidate telemetry"],
-                        )
-                    },
-                )
-
             attributed_events = [e for e in matching_events if e.execution_token == run_token]
-            if not attributed_events:
-                # All candidate matching events have different tokens (mismatched)
-                return self._make_result(
-                    run=run,
-                    scenario=scenario,
-                    category=DiagnosticCategory.EXPECTED_TELEMETRY_MISSING,
-                    reason=f"Telemetry observed on host but none match test run execution token '{run_token}'",
-                    confidence="likely",
-                    supporting_evidence=all_evidence_ids,
-                    diagnostic_reasons=[
-                        f"Mismatched tokens on {len(matching_events)} candidate event(s) rejected under strict attribution"
-                    ],
-                    metadata={
-                        "attribution": self._build_attribution_metadata(
-                            run_token=run_token,
-                            status=AttributionStatus.MISMATCHED.value,
-                            is_strict=True,
-                            events=matching_events,
-                            notes=["Mismatched tokens on candidate telemetry"],
-                        )
-                    },
-                )
-            matching_events = attributed_events
+            if attributed_events:
+                # Matching token found: attribute strictly to the run.
+                # Do not reject matching telemetry solely because unrelated untokenized events coexist.
+                matching_events = attributed_events
+            else:
+                # No matching token found among candidate matching events.
+                # If untokenized candidate events exist, missing evidence prevents definitive classification.
+                untokenized_events = [e for e in matching_events if e.execution_token is None]
+                if untokenized_events:
+                    return self._make_result(
+                        run=run,
+                        scenario=scenario,
+                        category=DiagnosticCategory.INCONCLUSIVE,
+                        reason=(
+                            "Matching telemetry events lack execution tokens required for strict attribution; "
+                            "missing evidence prevents causal linking"
+                        ),
+                        confidence="uncertain",
+                        supporting_evidence=[e.normalized_event_id for e in matching_events],
+                        metadata={
+                            "attribution": self._build_attribution_metadata(
+                                run_token=run_token,
+                                status=AttributionStatus.INCONCLUSIVE.value,
+                                is_strict=True,
+                                events=matching_events,
+                                notes=["Missing execution token on candidate telemetry"],
+                            )
+                        },
+                    )
+                else:
+                    # All candidate matching events have different tokens (mismatched)
+                    return self._make_result(
+                        run=run,
+                        scenario=scenario,
+                        category=DiagnosticCategory.EXPECTED_TELEMETRY_MISSING,
+                        reason=f"Telemetry observed on host but none match test run execution token '{run_token}'",
+                        confidence="likely",
+                        supporting_evidence=all_evidence_ids,
+                        diagnostic_reasons=[
+                            f"Mismatched tokens on {len(matching_events)} candidate event(s) rejected under strict attribution"
+                        ],
+                        metadata={
+                            "attribution": self._build_attribution_metadata(
+                                run_token=run_token,
+                                status=AttributionStatus.MISMATCHED.value,
+                                is_strict=True,
+                                events=matching_events,
+                                notes=["Mismatched tokens on candidate telemetry"],
+                            )
+                        },
+                    )
 
         matched_evidence_ids = [e.normalized_event_id for e in matching_events]
 
@@ -485,12 +502,37 @@ class AssuranceEngine:
             rule_id, window_start=search_start, window_end=search_end
         )
 
-        # Check candidate alerts on target host lacking timestamps
-        missing_ts_candidate_alerts = [
-            a
-            for a in self.store.list_alerts_for_rule(rule_id)
-            if a.alert_timestamp is None and hosts_match(run.target_host, a.host_id)
-        ]
+        # Check candidate alerts on target host lacking timestamps within defensible scope:
+        # 1. Alert must reference this detection rule and match target host.
+        # 2. In strict mode, an alert with an explicit mismatched token belongs to another execution
+        #    and must be rejected rather than forcing INCONCLUSIVE.
+        # 3. For temporal relevance: an alert lacking an event timestamp cannot be presumed
+        #    to belong to all future runs. It is considered an in-scope candidate for this run
+        #    only if its ingestion timestamp (ingested_at) was NOT prior to the run's evaluation
+        #    window (i.e. not historical: a.ingested_at is not before search_start).
+        #    Historical alerts ingested prior to search_start cannot have been produced by this run.
+        #    Completely undated alerts (lacking both event timestamp and ingestion time) are not
+        #    silently treated as current unless explicitly bearing the run's execution token.
+        missing_ts_candidate_alerts = []
+        for a in self.store.list_alerts_for_rule(rule_id):
+            if a.alert_timestamp is not None:
+                continue
+            if not hosts_match(run.target_host, a.host_id):
+                continue
+            if is_strict and a.execution_token is not None and a.execution_token != run_token and a.execution_token != "CONFLICT":
+                continue
+            # Check temporal anchoring:
+            if a.ingested_at is not None:
+                if _is_before_window(a.ingested_at, search_start):
+                    # Historical alert ingested before search window started — out of scope
+                    continue
+            else:
+                # Alert has no alert_timestamp and no ingested_at.
+                # Do not silently treat undated alerts as current unless explicitly tagged with run_token.
+                if not (is_strict and a.execution_token == run_token):
+                    continue
+            missing_ts_candidate_alerts.append(a)
+
         if missing_ts_candidate_alerts and not self._has_valid_timestamped_alert(run, all_rule_alerts, is_strict, run_token):
             missing_alert_ids = [a.alert_id for a in missing_ts_candidate_alerts]
             attr_meta = self._build_attribution_metadata(
@@ -665,40 +707,7 @@ class AssuranceEngine:
                 ],
             )
 
-        # 2. Check for missing tokens on candidate alerts on host within execution window
-        # Missing evidence prevents causal linking -> INCONCLUSIVE
-        missing_token_window_alerts = [
-            a for a in host_candidate_alerts
-            if a.execution_token is None and _is_in_window(a.alert_timestamp, run.window_start, run.window_end)
-        ]
-        if missing_token_window_alerts:
-            attr_meta = self._build_attribution_metadata(
-                run_token=run_token,
-                status=AttributionStatus.INCONCLUSIVE.value,
-                is_strict=True,
-                events=matching_events,
-                alerts=missing_token_window_alerts,
-                notes=["Candidate alert in execution window lacks execution token"],
-            )
-            return self._make_result(
-                run=run,
-                scenario=scenario,
-                category=DiagnosticCategory.INCONCLUSIVE,
-                reason=(
-                    f"Alert from expected rule {rule_id} observed on host {run.target_host} within window "
-                    f"but lacks execution token; missing evidence prevents strict attribution"
-                ),
-                confidence="uncertain",
-                supporting_evidence=matched_evidence_ids,
-                contradictory_evidence=[a.alert_id for a in missing_token_window_alerts],
-                metadata={"attribution": attr_meta},
-                diagnostic_reasons=[
-                    f"Alert '{a.alert_id}' has no execution token; cannot prove causal attribution in strict mode"
-                    for a in missing_token_window_alerts
-                ],
-            )
-
-        # 3. Separate matching vs mismatched alerts
+        # 2. Separate matching vs mismatched alerts
         matching_token_alerts = [
             a for a in all_rule_alerts if a.execution_token == run_token
         ]
@@ -713,8 +722,9 @@ class AssuranceEngine:
             if hosts_match(run.target_host, a.host_id) and _is_in_window(a.alert_timestamp, run.window_start, run.window_end)
         ]
 
+        # 3. Check for valid matching-token alert inside execution window FIRST.
+        # An untokenized alert on the host must not block a verified matching-token alert.
         if correlated_alerts:
-            # Full PASS: matching token + target host + strictly within execution window
             failure_cat, latency_meta, latency_notes = self._compute_latency(
                 scenario, matching_events, correlated_alerts
             )
@@ -820,6 +830,40 @@ class AssuranceEngine:
                 diagnostic_reasons=[
                     f"Alert '{a.alert_id}' with token '{run_token}' observed on mismatched host '{a.host_id}'"
                     for a in diff_host_matching_alerts
+                ],
+            )
+
+        # 6. Only if NO matching token alert exists anywhere:
+        # Check for missing tokens on candidate alerts on host within execution window
+        # Missing evidence prevents causal linking -> INCONCLUSIVE
+        missing_token_window_alerts = [
+            a for a in host_candidate_alerts
+            if a.execution_token is None and _is_in_window(a.alert_timestamp, run.window_start, run.window_end)
+        ]
+        if missing_token_window_alerts:
+            attr_meta = self._build_attribution_metadata(
+                run_token=run_token,
+                status=AttributionStatus.INCONCLUSIVE.value,
+                is_strict=True,
+                events=matching_events,
+                alerts=missing_token_window_alerts,
+                notes=["Candidate alert in execution window lacks execution token"],
+            )
+            return self._make_result(
+                run=run,
+                scenario=scenario,
+                category=DiagnosticCategory.INCONCLUSIVE,
+                reason=(
+                    f"Alert from expected rule {rule_id} observed on host {run.target_host} within window "
+                    f"but lacks execution token; missing evidence prevents strict attribution"
+                ),
+                confidence="uncertain",
+                supporting_evidence=matched_evidence_ids,
+                contradictory_evidence=[a.alert_id for a in missing_token_window_alerts],
+                metadata={"attribution": attr_meta},
+                diagnostic_reasons=[
+                    f"Alert '{a.alert_id}' has no execution token; cannot prove causal attribution in strict mode"
+                    for a in missing_token_window_alerts
                 ],
             )
 
