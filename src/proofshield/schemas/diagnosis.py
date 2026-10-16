@@ -76,3 +76,18 @@ class DiagnosticResultV1(ProofshieldBaseModel):
         default_factory=dict,
         description="Evaluation telemetry, latency calculations, rule match metrics",
     )
+
+    @property
+    def checks_performed(self) -> List[Dict[str, Any]]:
+        """Structured list of validation checks performed during evaluation."""
+        return self.metadata.get("checks_performed", [])
+
+    @property
+    def alternative_eliminations(self) -> Dict[str, str]:
+        """Deterministic explanations for why alternative diagnostic categories were eliminated."""
+        return self.metadata.get("alternative_eliminations", {})
+
+    @property
+    def missing_evidence(self) -> bool:
+        """Indicates whether the diagnostic verdict was driven by missing evidence."""
+        return bool(self.metadata.get("missing_evidence", False))

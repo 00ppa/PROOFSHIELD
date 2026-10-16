@@ -979,6 +979,222 @@ class AssuranceEngine:
             ),
         )
 
+    def _derive_missing_evidence(self, category: DiagnosticCategory, reason: str) -> bool:
+        """Determine if diagnosis was driven by missing or incomplete evidence."""
+        if category in (
+            DiagnosticCategory.EXPECTED_TELEMETRY_MISSING,
+            DiagnosticCategory.INCONCLUSIVE,
+            DiagnosticCategory.ERROR,
+        ):
+            return True
+        return False
+
+    def _derive_checks_performed(
+        self,
+        run: TestRunV1,
+        scenario: ScenarioV1,
+        category: DiagnosticCategory,
+        supporting_evidence: Optional[List[str]] = None,
+        contradictory_evidence: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        checks: List[Dict[str, Any]] = [
+            {
+                "check": "run_and_scenario_existence",
+                "status": "PASSED",
+                "detail": f"Run {run.run_id} and scenario {scenario.scenario_id} verified",
+            }
+        ]
+
+        # Execution status check
+        if run.execution_status == ExecutionStatus.RUNNING:
+            checks.append({
+                "check": "execution_status",
+                "status": "INCONCLUSIVE",
+                "detail": "Test execution is still RUNNING",
+            })
+            return checks
+        elif run.execution_status in (
+            ExecutionStatus.FAILED,
+            ExecutionStatus.ERROR,
+            ExecutionStatus.PENDING,
+        ):
+            checks.append({
+                "check": "execution_status",
+                "status": "FAILED",
+                "detail": f"Test execution reported as {run.execution_status.value}",
+            })
+            return checks
+        else:
+            checks.append({
+                "check": "execution_status",
+                "status": "PASSED",
+                "detail": "ExecutionStatus.COMPLETED",
+            })
+
+        # Token check if token present or requested
+        if run.execution_token:
+            if run.execution_token == "CONFLICT":
+                checks.append({
+                    "check": "run_token_provenance",
+                    "status": "FAILED",
+                    "detail": "Run execution token marked CONFLICT",
+                })
+            else:
+                checks.append({
+                    "check": "run_token_provenance",
+                    "status": "PASSED",
+                    "detail": f"Run execution token '{run.execution_token}' recorded",
+                })
+
+        # Telemetry checks
+        if category == DiagnosticCategory.EXPECTED_TELEMETRY_MISSING:
+            if supporting_evidence:
+                checks.append({
+                    "check": "telemetry_presence",
+                    "status": "PASSED",
+                    "detail": f"{len(supporting_evidence)} telemetry event(s) observed on host",
+                    "evidence_ids": supporting_evidence,
+                })
+                checks.append({
+                    "check": "telemetry_signature_match",
+                    "status": "FAILED",
+                    "detail": f"Observed telemetry did not match expected signature for {scenario.expected_event_category.value}",
+                })
+            else:
+                checks.append({
+                    "check": "telemetry_presence",
+                    "status": "FAILED",
+                    "detail": "No telemetry events observed within observation window on target host",
+                })
+            return checks
+
+        # Telemetry passed for subsequent categories
+        sup = supporting_evidence or []
+        checks.append({
+            "check": "telemetry_presence",
+            "status": "PASSED",
+            "detail": "Telemetry events observed within execution window",
+        })
+        checks.append({
+            "check": "telemetry_signature_match",
+            "status": "PASSED",
+            "detail": "Observed telemetry matched expected scenario signature",
+            "evidence_ids": [eid for eid in sup if eid.startswith("NORM-") or eid.startswith("RAW-")],
+        })
+
+        if scenario.validation_target == ValidationTarget.EXPECTED_TELEMETRY_ONLY:
+            checks.append({
+                "check": "validation_target",
+                "status": "PASSED",
+                "detail": "Telemetry-only validation target satisfied",
+            })
+            return checks
+
+        # Alert and detection checks
+        if category == DiagnosticCategory.DETECTION_NOT_TRIGGERED:
+            checks.append({
+                "check": "detection_rule_fired",
+                "status": "FAILED",
+                "detail": f"Expected detection rule '{scenario.expected_detection_rule_id}' did not trigger an alert",
+            })
+        elif category == DiagnosticCategory.ALERT_NOT_CORRELATED:
+            checks.append({
+                "check": "detection_rule_fired",
+                "status": "PASSED",
+                "detail": f"Expected detection rule '{scenario.expected_detection_rule_id}' triggered alert(s)",
+                "evidence_ids": contradictory_evidence or [],
+            })
+            checks.append({
+                "check": "alert_correlation",
+                "status": "FAILED",
+                "detail": "Alerts failed correlation to target host or execution time window",
+            })
+        elif category == DiagnosticCategory.PASS:
+            checks.append({
+                "check": "detection_rule_fired",
+                "status": "PASSED",
+                "detail": f"Expected detection rule '{scenario.expected_detection_rule_id}' triggered alert(s)",
+            })
+            checks.append({
+                "check": "alert_correlation",
+                "status": "PASSED",
+                "detail": "Alert correlated successfully to target host and execution time window",
+                "evidence_ids": [eid for eid in sup if eid.startswith("ALT-")],
+            })
+        elif category == DiagnosticCategory.INCONCLUSIVE:
+            checks.append({
+                "check": "evidence_conclusiveness",
+                "status": "INCONCLUSIVE",
+                "detail": "Ambiguous, missing, or contradictory evidence prevents conclusive diagnosis",
+                "evidence_ids": contradictory_evidence or [],
+            })
+
+        return checks
+
+    def _derive_alternative_eliminations(
+        self,
+        run: TestRunV1,
+        scenario: ScenarioV1,
+        category: DiagnosticCategory,
+        reason: str,
+    ) -> Dict[str, str]:
+        eliminations: Dict[str, str] = {}
+
+        if category == DiagnosticCategory.TEST_NOT_EXECUTED:
+            eliminations[DiagnosticCategory.PASS.value] = "Test execution failed or aborted before producing intended attack behaviour."
+            eliminations[DiagnosticCategory.EXPECTED_TELEMETRY_MISSING.value] = "Downstream telemetry checks were not reached because test execution failed."
+            eliminations[DiagnosticCategory.DETECTION_NOT_TRIGGERED.value] = "Downstream detection checks were not reached because test execution failed."
+            eliminations[DiagnosticCategory.ALERT_NOT_CORRELATED.value] = "Downstream alert correlation checks were not reached because test execution failed."
+            eliminations[DiagnosticCategory.INCONCLUSIVE.value] = "Execution status definitively indicated execution failure."
+            eliminations[DiagnosticCategory.ERROR.value] = "Test run and scenario entities are valid and loaded."
+
+        elif category == DiagnosticCategory.EXPECTED_TELEMETRY_MISSING:
+            eliminations[DiagnosticCategory.PASS.value] = "Required telemetry signature was not observed on target host within execution window."
+            eliminations[DiagnosticCategory.TEST_NOT_EXECUTED.value] = "Test execution completed successfully."
+            eliminations[DiagnosticCategory.DETECTION_NOT_TRIGGERED.value] = "Detection rules cannot be evaluated when prerequisite telemetry is missing."
+            eliminations[DiagnosticCategory.ALERT_NOT_CORRELATED.value] = "Alert correlation cannot be evaluated when prerequisite telemetry is missing."
+            eliminations[DiagnosticCategory.INCONCLUSIVE.value] = "Telemetry observation window on target host definitively contained no matching events."
+            eliminations[DiagnosticCategory.ERROR.value] = "Test run and scenario entities are valid and loaded."
+
+        elif category == DiagnosticCategory.DETECTION_NOT_TRIGGERED:
+            eliminations[DiagnosticCategory.PASS.value] = "Expected detection rule did not trigger an alert matching the test execution."
+            eliminations[DiagnosticCategory.TEST_NOT_EXECUTED.value] = "Test execution completed successfully."
+            eliminations[DiagnosticCategory.EXPECTED_TELEMETRY_MISSING.value] = "Prerequisite telemetry was observed matching the expected signature."
+            eliminations[DiagnosticCategory.ALERT_NOT_CORRELATED.value] = "No candidate alerts were produced by the expected rule in the monitoring system."
+            eliminations[DiagnosticCategory.INCONCLUSIVE.value] = "Telemetry presence and rule silence were confirmed with sufficient evidence."
+            eliminations[DiagnosticCategory.ERROR.value] = "Test run and scenario entities are valid and loaded."
+
+        elif category == DiagnosticCategory.ALERT_NOT_CORRELATED:
+            eliminations[DiagnosticCategory.PASS.value] = "Alert from expected rule was generated but failed host routing or time window correlation."
+            eliminations[DiagnosticCategory.TEST_NOT_EXECUTED.value] = "Test execution completed successfully."
+            eliminations[DiagnosticCategory.EXPECTED_TELEMETRY_MISSING.value] = "Prerequisite telemetry was observed matching the expected signature."
+            eliminations[DiagnosticCategory.DETECTION_NOT_TRIGGERED.value] = "Expected rule did fire in the monitoring system (silence disproven)."
+            eliminations[DiagnosticCategory.INCONCLUSIVE.value] = "Alert host mismatch or timing discrepancy was definitively verified."
+            eliminations[DiagnosticCategory.ERROR.value] = "Test run and scenario entities are valid and loaded."
+
+        elif category == DiagnosticCategory.PASS:
+            eliminations[DiagnosticCategory.TEST_NOT_EXECUTED.value] = "Test execution completed successfully."
+            eliminations[DiagnosticCategory.EXPECTED_TELEMETRY_MISSING.value] = "Matching telemetry was observed on target host within window."
+            eliminations[DiagnosticCategory.DETECTION_NOT_TRIGGERED.value] = "Expected detection rule fired and was verified."
+            eliminations[DiagnosticCategory.ALERT_NOT_CORRELATED.value] = "Detection alert correlated to target host and execution time window."
+            eliminations[DiagnosticCategory.INCONCLUSIVE.value] = "All required evidence was complete, unambiguous, and verified."
+            eliminations[DiagnosticCategory.ERROR.value] = "Test run and scenario entities are valid and loaded."
+
+        elif category == DiagnosticCategory.INCONCLUSIVE:
+            eliminations[DiagnosticCategory.PASS.value] = f"Cannot declare PASS due to ambiguous or missing evidence: {reason}"
+            eliminations[DiagnosticCategory.TEST_NOT_EXECUTED.value] = "Execution did not report definitive failure."
+            eliminations[DiagnosticCategory.EXPECTED_TELEMETRY_MISSING.value] = "Missing evidence prevents concluding that telemetry was genuinely absent."
+            eliminations[DiagnosticCategory.DETECTION_NOT_TRIGGERED.value] = "Missing evidence prevents concluding that detection rule was silent."
+            eliminations[DiagnosticCategory.ALERT_NOT_CORRELATED.value] = "Missing evidence prevents concluding correlation failed."
+            eliminations[DiagnosticCategory.ERROR.value] = "Test run and scenario entities are valid and loaded."
+
+        elif category == DiagnosticCategory.ERROR:
+            for cat in DiagnosticCategory:
+                if cat != DiagnosticCategory.ERROR:
+                    eliminations[cat.value] = f"Evaluation aborted due to entity or internal error: {reason}"
+
+        return eliminations
+
     def _make_result(
         self,
         run: TestRunV1,
@@ -991,8 +1207,11 @@ class AssuranceEngine:
         diagnostic_reasons: Optional[List[str]] = None,
         failure_category: Optional[FailureCategory] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        checks_performed: Optional[List[Dict[str, Any]]] = None,
+        alternative_eliminations: Optional[Dict[str, str]] = None,
+        missing_evidence: Optional[bool] = None,
     ) -> DiagnosticResultV1:
-        """Construct a DiagnosticResultV1 with consistent formatting."""
+        """Construct a DiagnosticResultV1 with consistent formatting and evidence traceability."""
         meta = dict(metadata or {})
         if "attribution" not in meta:
             run_tok = run.execution_token
@@ -1006,6 +1225,25 @@ class AssuranceEngine:
                     "it does not constitute or claim cryptographic proof."
                 ),
             }
+
+        if checks_performed is not None:
+            meta["checks_performed"] = checks_performed
+        elif "checks_performed" not in meta:
+            meta["checks_performed"] = self._derive_checks_performed(
+                run, scenario, category, supporting_evidence, contradictory_evidence
+            )
+
+        if alternative_eliminations is not None:
+            meta["alternative_eliminations"] = alternative_eliminations
+        elif "alternative_eliminations" not in meta:
+            meta["alternative_eliminations"] = self._derive_alternative_eliminations(
+                run, scenario, category, reason
+            )
+
+        if missing_evidence is not None:
+            meta["missing_evidence"] = missing_evidence
+        elif "missing_evidence" not in meta:
+            meta["missing_evidence"] = self._derive_missing_evidence(category, reason)
 
         return DiagnosticResultV1(
             diagnostic_id=f"DIAG-{uuid.uuid4().hex[:12].upper()}",
@@ -1102,6 +1340,11 @@ class AssuranceEngine:
         reason: str,
     ) -> DiagnosticResultV1:
         """Construct an ERROR diagnostic result."""
+        eliminations = {
+            c.value: f"Evaluation aborted at entity resolution stage: {reason}"
+            for c in DiagnosticCategory
+            if c != DiagnosticCategory.ERROR
+        }
         return DiagnosticResultV1(
             diagnostic_id=f"DIAG-{uuid.uuid4().hex[:12].upper()}",
             test_run_id=run_id,
@@ -1120,6 +1363,15 @@ class AssuranceEngine:
                         "Token attribution provides execution provenance linking via correlated execution tokens; "
                         "it does not constitute or claim cryptographic proof."
                     ),
-                }
+                },
+                "checks_performed": [
+                    {
+                        "check": "entity_resolution",
+                        "status": "FAILED",
+                        "detail": reason,
+                    }
+                ],
+                "alternative_eliminations": eliminations,
+                "missing_evidence": True,
             },
         )

@@ -16,7 +16,9 @@ from proofshield.schemas.diagnosis import DiagnosticResultV1
 from proofshield.schemas.ground_truth import GroundTruthV1
 from proofshield.schemas.scenario import ScenarioV1
 from proofshield.schemas.telemetry import NormalizedTelemetryEventV1, RawTelemetryEventV1
+from proofshield.config import StorageBackend, get_settings
 from proofshield.schemas.test_run import TestRunV1
+from proofshield.services.base_store import StoreProtocol
 
 
 def hosts_match(host1: str, host2: str) -> bool:
@@ -349,12 +351,53 @@ class InMemoryStore:
 
 
 # Module-level singleton
-_store_instance: Optional[InMemoryStore] = None
+_store_instance: Optional[StoreProtocol] = None
 
 
-def get_store() -> InMemoryStore:
-    """Get or create the global in-memory store instance."""
+def get_store() -> StoreProtocol:
+    """Get or create the global store instance based on active configuration.
+
+    Default backend: InMemoryStore.
+    If configured for SQLite: SQLiteStore with configured path.
+    Startup/configuration failures raise immediately and NEVER silently fall back.
+    """
     global _store_instance
     if _store_instance is None:
-        _store_instance = InMemoryStore()
+        settings = get_settings()
+        if settings.storage_backend == StorageBackend.MEMORY:
+            _store_instance = InMemoryStore()
+        elif settings.storage_backend == StorageBackend.SQLITE:
+            from proofshield.services.sqlite_store import SQLiteStore
+            _store_instance = SQLiteStore(settings.sqlite_path)
     return _store_instance
+
+
+def set_store(store: Optional[StoreProtocol]) -> None:
+    """Set or override the global store instance. Used for testing or custom lifecycles."""
+    global _store_instance
+    if _store_instance is not None and _store_instance is not store:
+        if hasattr(_store_instance, "close"):
+            try:
+                _store_instance.close()
+            except Exception:
+                pass
+    _store_instance = store
+
+
+def close_store() -> None:
+    """Close and clean up the active store instance if it supports close()."""
+    global _store_instance
+    if _store_instance is not None:
+        if hasattr(_store_instance, "close"):
+            try:
+                _store_instance.close()
+            except Exception:
+                pass
+        _store_instance = None
+
+
+def reset_store() -> None:
+    """Close and reset the active store singleton, forcing re-creation on next get_store()."""
+    close_store()
+    from proofshield.config import reset_settings
+    reset_settings()
