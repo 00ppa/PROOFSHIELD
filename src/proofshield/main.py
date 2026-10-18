@@ -1,5 +1,4 @@
-"""PROOFSHIELD FastAPI Application Entry Point."""
-
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -7,6 +6,18 @@ from proofshield import __version__
 from proofshield.api.routes_evaluation import router as evaluation_router
 from proofshield.api.routes_health import router as health_router
 from proofshield.api.routes_telemetry import router as telemetry_router
+from proofshield.services.store import close_store, get_store
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle manager: initializes and validates storage on startup, cleans up on shutdown."""
+    # Eagerly initialize and validate the configured store on startup.
+    # If the configured backend or path is invalid, fails fast with clear exception.
+    get_store()
+    yield
+    # Clean up storage connections on application shutdown
+    close_store()
 
 
 def create_application() -> FastAPI:
@@ -21,6 +32,7 @@ def create_application() -> FastAPI:
         version=__version__,
         docs_url="/docs",
         redoc_url="/redoc",
+        lifespan=lifespan,
     )
 
     # Permissive local CORS for development

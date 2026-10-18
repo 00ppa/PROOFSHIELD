@@ -30,3 +30,10 @@ htmlcov/
 Thumbs.db
 .gemini/
 artifacts/
+
+# SQLite & Database runtime files
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
