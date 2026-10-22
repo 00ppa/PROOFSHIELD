@@ -31,13 +31,18 @@ class JSONLValidationReport(BaseModel, Generic[T]):
 
 
 def load_jsonl_raw(source: Union[str, Path, TextIO]) -> List[Dict[str, Any]]:
-    """Load JSONL lines as raw dictionaries.
+    """Load JSONL lines as raw dictionaries, skipping malformed lines.
+
+    Malformed JSON lines are silently skipped so that a single corrupted
+    record cannot abort ingestion of the remaining valid records.  This
+    is consistent with the fault-isolation guarantee already provided by
+    :func:`validate_jsonl_stream`.
 
     Args:
         source: File path or open text stream.
 
     Returns:
-        List of parsed JSON dictionaries.
+        List of parsed JSON dictionaries (one per successfully decoded line).
     """
     records: List[Dict[str, Any]] = []
 
@@ -51,7 +56,11 @@ def load_jsonl_raw(source: Union[str, Path, TextIO]) -> List[Dict[str, Any]]:
         stripped = line.strip()
         if not stripped:
             continue
-        records.append(json.loads(stripped))
+        try:
+            records.append(json.loads(stripped))
+        except json.JSONDecodeError:
+            # Skip malformed lines; partial import is preferred over full abort.
+            continue
 
     return records
 

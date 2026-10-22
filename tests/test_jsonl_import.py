@@ -99,3 +99,43 @@ def test_validate_ground_truth_jsonl_fixture(ground_truth_jsonl_path: Path):
     assert report.error_count == 0
     assert report.records[0].ground_truth_id == "GT-RUN-20261012-001"
 
+
+def test_load_jsonl_raw_tolerates_malformed_lines(
+    raw_telemetry_malformed_path: Path,
+) -> None:
+    """Regression: load_jsonl_raw must not raise on malformed JSON lines.
+
+    Fixture layout (raw_telemetry_malformed_v1.jsonl):
+      line 1 – valid JSON dict  (RAW-SYS-OK-01)
+      line 2 – blank
+      line 3 – corrupted JSON   (must be skipped)
+      line 4 – blank
+      line 5 – valid JSON dict  (RAW-SYS-OK-02)
+      line 6 – valid JSON dict, schema-invalid (missing source_event_id) – RAW-ERR-03
+      line 7 – valid JSON dict, schema-invalid (bad datetime)             – RAW-ERR-04
+
+    load_jsonl_raw is a raw decoder only (no schema validation), so lines 6
+    and 7 must be included.  The corrupted line 3 must produce no record.
+    Previously the function propagated json.JSONDecodeError on line 3, aborting
+    the entire import and losing the four records that follow it.
+    """
+    records = load_jsonl_raw(raw_telemetry_malformed_path)
+
+    assert isinstance(records, list), "load_jsonl_raw must always return a list"
+    # Exactly 4 parseable dicts: lines 1, 5, 6, 7.  Line 3 (corrupted JSON)
+    # must be skipped; blank lines are ignored.
+    assert len(records) == 4, (
+        f"Expected exactly 4 parsed dicts from malformed fixture, got {len(records)}"
+    )
+
+    raw_ids = {r.get("raw_event_id") for r in records if isinstance(r, dict)}
+
+    # Records before the bad line must be preserved.
+    assert "RAW-SYS-OK-01" in raw_ids, "Record before bad line must be present"
+    # Records after the bad line must be preserved (this was the pre-fix failure mode).
+    assert "RAW-SYS-OK-02" in raw_ids, "Record after bad line must be present"
+    # Schema-invalid-but-syntactically-valid records must also be returned
+    # (schema enforcement is the caller's responsibility, not load_jsonl_raw's).
+    assert "RAW-ERR-03" in raw_ids, "Schema-invalid-but-parseable record must be returned"
+    assert "RAW-ERR-04" in raw_ids, "Schema-invalid-but-parseable record must be returned"
+
