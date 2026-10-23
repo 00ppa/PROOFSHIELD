@@ -119,6 +119,9 @@ def extract_execution_token(
     return None
 
 
+_HASH_IGNORE_VALUES = {"none", "null", "nil", "undefined", "false", "true", "empty"}
+
+
 def _ensure_utc(dt: datetime) -> datetime:
     """Ensure datetime has UTC timezone."""
     if dt.tzinfo is None:
@@ -126,16 +129,99 @@ def _ensure_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def _parse_hashes(hash_str: Optional[str]) -> Dict[str, str]:
-    """Parse Sysmon / EDR hash string like 'SHA256=xxx,MD5=yyy' into a dictionary."""
-    if not hash_str:
+def _clean_str(val: Any) -> Optional[str]:
+    """Clean scalar string value, returning None if empty, whitespace, or non-scalar."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (str, int, float)):
+        s = str(val).strip()
+        return s if s else None
+    return None
+
+
+def _clean_path(val: Any) -> Optional[str]:
+    """Clean path value, returning None if not a non-empty string."""
+    if isinstance(val, str):
+        s = val.strip()
+        return s if s else None
+    return None
+
+
+def _extract_basename(path_val: Any) -> Optional[str]:
+    """Extract executable basename safely across Windows and POSIX path representations."""
+    if not path_val or not isinstance(path_val, str):
+        return None
+    cleaned = path_val.strip().replace("\\", "/")
+    base = cleaned.rstrip("/").split("/")[-1]
+    return base if base else None
+
+
+def _parse_port(raw_port: Any) -> Optional[int]:
+    """Parse port into valid integer [0, 65535] or return None."""
+    if raw_port is None or isinstance(raw_port, bool):
+        return None
+    try:
+        if isinstance(raw_port, (int, str)):
+            s = str(raw_port).strip()
+            if s.isdigit():
+                port = int(s)
+                if 0 <= port <= 65535:
+                    return port
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _parse_hashes(hash_input: Any) -> Dict[str, str]:
+    """Parse Sysmon / EDR hash string or structured dictionary into a clean {algo: hex} map.
+
+    Guarantees:
+    - Never raises on unexpected types (int, list, dict, bool, None).
+    - Rejects empty algorithms, empty hash values, and placeholder values ('none', 'null').
+    - Supports comma/semicolon delimited 'ALGO=hash' strings and structured dicts.
+    - Normalizes algorithm names and hash values to lowercase.
+    """
+    if not hash_input or isinstance(hash_input, bool):
         return {}
-    results = {}
-    for part in hash_str.split(","):
-        part = part.strip()
+
+    results: Dict[str, str] = {}
+
+    if isinstance(hash_input, dict):
+        for k, v in hash_input.items():
+            if not k or isinstance(k, bool) or not isinstance(k, (str, int)):
+                continue
+            algo = str(k).strip().lower()
+            if len(algo) < 2 or not re.match(r"^[a-z0-9_\-]+$", algo):
+                continue
+            if isinstance(v, (str, int)) and not isinstance(v, bool):
+                val = str(v).strip().lower()
+                if val and val not in _HASH_IGNORE_VALUES and "\\" not in val and " " not in val:
+                    results[algo] = val
+        return results
+
+    if isinstance(hash_input, (list, tuple)):
+        items = hash_input
+    elif isinstance(hash_input, str):
+        items = re.split(r"[,;]", hash_input)
+    else:
+        return {}
+
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        part = item.strip()
         if "=" in part:
             algo, val = part.split("=", 1)
-            results[algo.strip().lower()] = val.strip().lower()
+        elif ":" in part and not part.startswith(("http:", "https:")):
+            algo, val = part.split(":", 1)
+        else:
+            continue
+        algo = algo.strip().lower()
+        val = val.strip().lower()
+        if len(algo) >= 2 and re.match(r"^[a-z0-9_\-]+$", algo):
+            if val and val not in _HASH_IGNORE_VALUES and "\\" not in val and " " not in val:
+                results[algo] = val
+
     return results
 
 
@@ -163,46 +249,60 @@ class SysmonNormaliser(BaseNormaliser):
 
     def normalize(self, raw_event: RawTelemetryEventV1) -> NormalizedTelemetryEventV1:
         p = raw_event.raw_payload
-        event_id = int(p.get("EventID", 0)) if str(p.get("EventID", "")).isdigit() else 0
+        raw_event_id_str = str(p.get("EventID", "")).strip()
+        event_id = int(raw_event_id_str) if raw_event_id_str.isdigit() else 0
         category = self.EVENT_ID_MAP.get(event_id, EventCategory.OTHER)
 
         # Preserve source event identifier
         # If payload provides a specific record ID, prefer that or fallback to raw_event.source_event_id
-        src_id = str(p.get("RecordId") or p.get("EventRecordID") or raw_event.source_event_id)
+        src_id = (
+            _clean_str(p.get("RecordId"))
+            or _clean_str(p.get("EventRecordID"))
+            or _clean_str(raw_event.source_event_id)
+            or "unknown_event"
+        )
 
         # Standardise timestamps
         src_ts = _ensure_utc(raw_event.source_timestamp)
         norm_ts = src_ts
 
         # Host extraction
-        host = str(p.get("Computer") or p.get("host") or p.get("Host") or "unknown_host")
+        host = (
+            _clean_str(p.get("Computer"))
+            or _clean_str(p.get("host"))
+            or _clean_str(p.get("Host"))
+            or "unknown_host"
+        )
 
         # Process details
-        image_path = p.get("Image")
-        process_name = os.path.basename(image_path) if image_path else None
-        cmd_line = p.get("CommandLine")
-        parent_image = p.get("ParentImage")
-        parent_name = os.path.basename(parent_image) if parent_image else None
-        parent_cmd = p.get("ParentCommandLine")
-        user = p.get("User")
+        image_path = _clean_path(p.get("Image"))
+        process_name = _extract_basename(image_path)
+        cmd_line = _clean_str(p.get("CommandLine"))
+        parent_image = _clean_path(p.get("ParentImage"))
+        parent_name = _extract_basename(parent_image)
+        parent_cmd = _clean_str(p.get("ParentCommandLine"))
+        user = _clean_str(p.get("User"))
 
         # Hashes
         hashes = _parse_hashes(p.get("Hashes"))
-        if not hashes and p.get("Sha256"):
-            hashes["sha256"] = str(p.get("Sha256")).lower()
+        if p.get("hashes"):
+            for k, v in _parse_hashes(p.get("hashes")).items():
+                if k not in hashes:
+                    hashes[k] = v
+        if "sha256" not in hashes and p.get("Sha256"):
+            sha_val = _clean_str(p.get("Sha256"))
+            if sha_val and sha_val.lower() not in _HASH_IGNORE_VALUES:
+                hashes["sha256"] = sha_val.lower()
 
         # Network details
-        dest_ip = p.get("DestinationIp")
-        dest_port = None
-        raw_port = p.get("DestinationPort")
-        if raw_port is not None and str(raw_port).isdigit():
-            dest_port = int(raw_port)
+        dest_ip = _clean_str(p.get("DestinationIp"))
+        dest_port = _parse_port(p.get("DestinationPort"))
 
         # Extra attributes: collect fields not directly mapped
         known_keys = {
             "EventID", "RecordId", "EventRecordID", "Computer", "host", "Host",
             "Image", "CommandLine", "ParentImage", "ParentCommandLine", "User",
-            "Hashes", "Sha256", "DestinationIp", "DestinationPort", "UtcTime",
+            "Hashes", "hashes", "Sha256", "DestinationIp", "DestinationPort", "UtcTime",
             "execution_token", "ExecutionToken", "token", "Token", "proofshield_token",
         }
         extra = {k: v for k, v in p.items() if k not in known_keys}
@@ -261,45 +361,88 @@ class GenericEDRNormaliser(BaseNormaliser):
 
     def normalize(self, raw_event: RawTelemetryEventV1) -> NormalizedTelemetryEventV1:
         p = raw_event.raw_payload
-        raw_cat = str(p.get("event_type") or p.get("action") or p.get("type") or "").lower()
+        raw_cat = str(p.get("event_type") or p.get("action") or p.get("type") or "").strip().lower()
         category = self.CATEGORY_MAPPING.get(raw_cat, EventCategory.OTHER)
 
-        src_id = str(p.get("event_id") or p.get("id") or raw_event.source_event_id)
+        src_id = (
+            _clean_str(p.get("event_id"))
+            or _clean_str(p.get("id"))
+            or _clean_str(raw_event.source_event_id)
+            or "unknown_event"
+        )
         src_ts = _ensure_utc(raw_event.source_timestamp)
 
         # Host and user
-        host = str(p.get("hostname") or p.get("host") or p.get("endpoint_id") or p.get("device_name") or "unknown_host")
-        user = p.get("username") or p.get("user") or p.get("account")
+        host = (
+            _clean_str(p.get("hostname"))
+            or _clean_str(p.get("host"))
+            or _clean_str(p.get("endpoint_id"))
+            or _clean_str(p.get("device_name"))
+            or "unknown_host"
+        )
+        user = (
+            _clean_str(p.get("username"))
+            or _clean_str(p.get("user"))
+            or _clean_str(p.get("account"))
+        )
 
         # Process info
-        process_path = p.get("process_path") or p.get("binary_path") or p.get("image")
-        process_name = p.get("process_name") or (os.path.basename(process_path) if process_path else None)
-        cmd_line = p.get("command_line") or p.get("cmdline") or p.get("command")
-        parent_name = p.get("parent_process_name") or p.get("parent_name")
-        parent_cmd = p.get("parent_command_line") or p.get("parent_cmdline")
+        process_path = (
+            _clean_path(p.get("process_path"))
+            or _clean_path(p.get("binary_path"))
+            or _clean_path(p.get("image"))
+        )
+        process_name = _clean_str(p.get("process_name")) or _extract_basename(process_path)
+        cmd_line = (
+            _clean_str(p.get("command_line"))
+            or _clean_str(p.get("cmdline"))
+            or _clean_str(p.get("command"))
+        )
+        parent_name = (
+            _clean_str(p.get("parent_process_name"))
+            or _clean_str(p.get("parent_name"))
+        )
+        if not parent_name:
+            parent_name = _extract_basename(
+                _clean_path(p.get("parent_path")) or _clean_path(p.get("parent_image"))
+            )
+        parent_cmd = (
+            _clean_str(p.get("parent_command_line"))
+            or _clean_str(p.get("parent_cmdline"))
+        )
 
         # Hashes
-        hashes: Dict[str, str] = {}
-        if isinstance(p.get("hashes"), dict):
-            hashes.update({k.lower(): str(v).lower() for k, v in p["hashes"].items()})
+        hashes = _parse_hashes(p.get("hashes"))
+        if p.get("Hashes"):
+            for k, v in _parse_hashes(p.get("Hashes")).items():
+                if k not in hashes:
+                    hashes[k] = v
         for hash_field in ("sha256", "md5", "sha1"):
-            if hash_field in p and p[hash_field]:
-                hashes[hash_field] = str(p[hash_field]).lower()
+            if hash_field not in hashes and hash_field in p:
+                field_val = _clean_str(p.get(hash_field))
+                if field_val and field_val.lower() not in _HASH_IGNORE_VALUES:
+                    hashes[hash_field] = field_val.lower()
 
         # Network
-        dest_ip = p.get("destination_ip") or p.get("dst_ip") or p.get("remote_ip")
-        dest_port = p.get("destination_port") or p.get("dst_port") or p.get("remote_port")
-        if dest_port is not None and str(dest_port).isdigit():
-            dest_port = int(dest_port)
-        else:
-            dest_port = None
+        dest_ip = (
+            _clean_str(p.get("destination_ip"))
+            or _clean_str(p.get("dst_ip"))
+            or _clean_str(p.get("remote_ip"))
+        )
+        dest_port = None
+        for port_key in ("destination_port", "dst_port", "remote_port"):
+            if port_key in p:
+                parsed_port = _parse_port(p[port_key])
+                if parsed_port is not None:
+                    dest_port = parsed_port
+                    break
 
         known_keys = {
             "event_type", "action", "type", "event_id", "id", "hostname", "host",
             "endpoint_id", "device_name", "username", "user", "account",
             "process_path", "binary_path", "image", "process_name", "command_line",
-            "cmdline", "command", "parent_process_name", "parent_name",
-            "parent_command_line", "parent_cmdline", "hashes", "sha256", "md5",
+            "cmdline", "command", "parent_process_name", "parent_name", "parent_path", "parent_image",
+            "parent_command_line", "parent_cmdline", "hashes", "Hashes", "sha256", "md5",
             "sha1", "destination_ip", "dst_ip", "remote_ip", "destination_port",
             "dst_port", "remote_port", "timestamp", "execution_token", "token", "proofshield_token",
         }
@@ -341,7 +484,7 @@ class FallbackNormaliser(BaseNormaliser):
 
     def normalize(self, raw_event: RawTelemetryEventV1) -> NormalizedTelemetryEventV1:
         p = raw_event.raw_payload
-        src_id = str(raw_event.source_event_id)
+        src_id = _clean_str(raw_event.source_event_id) or "unknown_event"
         src_ts = _ensure_utc(raw_event.source_timestamp)
 
         # Try best-effort case-insensitive field discovery
@@ -351,16 +494,30 @@ class FallbackNormaliser(BaseNormaliser):
             for c in candidates:
                 if c.lower() in flat_lower:
                     orig_key, val = flat_lower[c.lower()]
-                    return val
+                    if val is not None:
+                        if isinstance(val, str) and not val.strip():
+                            continue
+                        return val
             return None
 
-        host = str(find_val("host", "hostname", "computer", "device", "endpoint") or "unknown_host")
-        user = find_val("user", "username", "account")
-        cmd_line = find_val("command_line", "cmdline", "command", "process.command_line")
-        proc_name = find_val("process_name", "process", "image", "file_name")
-        proc_path = find_val("process_path", "image_path", "path")
+        host = _clean_str(find_val("host", "hostname", "computer", "device", "endpoint")) or "unknown_host"
+        user = _clean_str(find_val("user", "username", "account"))
+        cmd_line = _clean_str(find_val("command_line", "cmdline", "command", "process.command_line"))
+        proc_path = _clean_path(find_val("process_path", "image_path", "path"))
+        proc_name = _clean_path(find_val("process_name", "process", "image", "file_name"))
+        if proc_name:
+            proc_name = _extract_basename(proc_name)
+        elif proc_path:
+            proc_name = _extract_basename(proc_path)
 
-        token = extract_execution_token(p, text_fields=[str(cmd_line) if cmd_line else None])
+        hashes = _parse_hashes(find_val("hashes", "hash"))
+        for hash_field in ("sha256", "md5", "sha1"):
+            if hash_field not in hashes:
+                h_val = _clean_str(find_val(hash_field))
+                if h_val and h_val.lower() not in _HASH_IGNORE_VALUES:
+                    hashes[hash_field] = h_val.lower()
+
+        token = extract_execution_token(p, text_fields=[cmd_line, proc_path])
 
         return NormalizedTelemetryEventV1(
             normalized_event_id=f"NORM-{uuid.uuid4().hex[:12].upper()}",
@@ -370,10 +527,11 @@ class FallbackNormaliser(BaseNormaliser):
             normalized_timestamp=src_ts,
             event_category=EventCategory.OTHER,
             host=host,
-            user=str(user) if user else None,
-            process_name=str(proc_name) if proc_name else None,
-            process_path=str(proc_path) if proc_path else None,
-            command_line=str(cmd_line) if cmd_line else None,
+            user=user,
+            process_name=proc_name,
+            process_path=proc_path,
+            command_line=cmd_line,
+            hashes=hashes,
             execution_token=token,
             extra_attributes=dict(p),
         )

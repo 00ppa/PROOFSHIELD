@@ -139,3 +139,11 @@ def test_load_jsonl_raw_tolerates_malformed_lines(
     assert "RAW-ERR-03" in raw_ids, "Schema-invalid-but-parseable record must be returned"
     assert "RAW-ERR-04" in raw_ids, "Schema-invalid-but-parseable record must be returned"
 
+
+def test_validate_raw_telemetry_realistic_fixture(raw_telemetry_realistic_path: Path):
+    """Verify raw_telemetry_realistic_v1.jsonl parses all 3 realistic enterprise events cleanly."""
+    report = validate_jsonl_file(raw_telemetry_realistic_path, RawTelemetryEventV1)
+    assert report.is_valid is True
+    assert report.valid_count == 3
+    assert report.error_count == 0
+    assert len(report.records) == 3

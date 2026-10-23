@@ -43,6 +43,11 @@ def raw_telemetry_malformed_path(fixtures_dir: Path) -> Path:
 
 
 @pytest.fixture
+def raw_telemetry_realistic_path(fixtures_dir: Path) -> Path:
+    return fixtures_dir / "raw_telemetry_realistic_v1.jsonl"
+
+
+@pytest.fixture
 def detection_rules_jsonl_path(fixtures_dir: Path) -> Path:
     return fixtures_dir / "detection_rules_v1.jsonl"
 
