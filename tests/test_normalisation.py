@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from proofshield.normalisation.engine import (
+    AuditdNormaliser,
     FallbackNormaliser,
     GenericEDRNormaliser,
     NormalisationEngine,
@@ -501,3 +502,219 @@ def test_fallback_candidate_whitespace_and_port_zero_resilience():
     )
     norm_fallback = engine.normalize(raw_fallback)
     assert norm_fallback.host == "SRV-FALLBACK-PROD"
+
+
+def test_auditd_process_creation_and_token_extraction(raw_telemetry_auditd_path: Path):
+    """Verify Linux auditd SYSCALL process creation normalisation and token extraction."""
+    report = validate_jsonl_file(raw_telemetry_auditd_path, RawTelemetryEventV1)
+    raw_event = report.records[0]  # SYSCALL execve with args
+
+    engine = NormalisationEngine()
+    norm = engine.normalize(raw_event)
+
+    assert norm.source_event_id == "1760538130.100:1001"
+    assert norm.source_timestamp == raw_event.source_timestamp
+    assert norm.event_category == EventCategory.PROCESS_CREATION
+    assert norm.host == "srv-linux-prod01"
+    assert norm.user == "uid:0"
+    assert norm.process_name == "python3"
+    assert norm.process_path == "/usr/bin/python3"
+    assert norm.command_line == "python3 -c print('test') --execution-token=TOK-LINUX-AUD-001"
+    assert norm.execution_token == "TOK-LINUX-AUD-001"
+    assert norm.extra_attributes["key"] == "audit_proc"
+    assert norm.extra_attributes["auid"] == 1000
+
+
+def test_auditd_authentication_event(raw_telemetry_auditd_path: Path):
+    """Verify Linux auditd USER_AUTH normalisation into AUTHENTICATION category."""
+    report = validate_jsonl_file(raw_telemetry_auditd_path, RawTelemetryEventV1)
+    raw_event = report.records[1]  # USER_AUTH record
+
+    engine = NormalisationEngine()
+    norm = engine.normalize(raw_event)
+
+    assert norm.source_event_id == "1760538135.200:1002"
+    assert norm.source_timestamp == raw_event.source_timestamp
+    assert norm.event_category == EventCategory.AUTHENTICATION
+    assert norm.host == "srv-linux-prod01"
+    assert norm.user == "ubuntu"
+    assert norm.extra_attributes["terminal"] == "ssh"
+
+
+def test_auditd_sockaddr_network_event(raw_telemetry_auditd_path: Path):
+    """Verify Linux auditd SOCKADDR saddr hex parsing and NETWORK_CONNECTION category."""
+    report = validate_jsonl_file(raw_telemetry_auditd_path, RawTelemetryEventV1)
+    raw_event = report.records[2]  # SOCKADDR connect with 32-char hex saddr
+
+    engine = NormalisationEngine()
+    norm = engine.normalize(raw_event)
+
+    assert norm.source_event_id == "1760538140.300:1003"
+    assert norm.source_timestamp == raw_event.source_timestamp
+    assert norm.event_category == EventCategory.NETWORK_CONNECTION
+    assert norm.network_destination_ip == "192.0.2.145"
+    assert norm.network_destination_port == 443
+
+
+def test_auditd_insufficient_evidence_and_failed_execve(raw_telemetry_auditd_path: Path):
+    """Verify fragmented records (CWD) and failed executions do not infer PROCESS_CREATION."""
+    report = validate_jsonl_file(raw_telemetry_auditd_path, RawTelemetryEventV1)
+    engine = NormalisationEngine()
+
+    # Event 4: CWD record alone without process evidence
+    raw_cwd = report.records[3]
+    norm_cwd = engine.normalize(raw_cwd)
+    assert norm_cwd.event_category == EventCategory.OTHER
+    assert norm_cwd.extra_attributes["cwd"] == "/var/log"
+
+    # Event 5: Failed execve (success: "no")
+    raw_fail = report.records[4]
+    norm_fail = engine.normalize(raw_fail)
+    assert norm_fail.event_category == EventCategory.OTHER
+    assert norm_fail.process_name == "malware"
+    assert norm_fail.process_path == "/tmp/malware"
+    assert norm_fail.extra_attributes["exit"] == -13
+
+
+def test_auditd_individual_args_and_malformed_sockaddr():
+    """Verify a0, a1, a2 argument reconstruction and graceful handling of malformed sockaddr."""
+    t0 = datetime(2026, 10, 20, 10, 0, tzinfo=timezone.utc)
+    engine = NormalisationEngine()
+
+    # a0, a1, a2 argument extraction
+    raw_args = RawTelemetryEventV1(
+        raw_event_id="RAW-AUD-ARGS-01",
+        source_event_id="AUD-ARGS-1",
+        source_format="auditd",
+        source_timestamp=t0,
+        ingested_at=t0,
+        raw_payload={
+            "type": "EXECVE",
+            "node": "srv-linux-02",
+            "a0": "/bin/sh",
+            "a1": "-c",
+            "a2": "echo hello",
+            "success": True,
+        },
+    )
+    norm_args = engine.normalize(raw_args)
+    assert norm_args.command_line == "/bin/sh -c echo hello"
+    assert norm_args.event_category == EventCategory.PROCESS_CREATION
+
+    # Malformed sockaddr must not raise and defaults to OTHER when no valid network fields exist
+    raw_bad_sock = RawTelemetryEventV1(
+        raw_event_id="RAW-AUD-SOCK-02",
+        source_event_id="AUD-SOCK-2",
+        source_format="auditd",
+        source_timestamp=t0,
+        ingested_at=t0,
+        raw_payload={
+            "type": "SOCKADDR",
+            "node": "srv-linux-02",
+            "saddr": "invalid_hex_string_too_short",
+        },
+    )
+    norm_bad_sock = engine.normalize(raw_bad_sock)
+    assert norm_bad_sock.network_destination_ip is None
+    assert norm_bad_sock.network_destination_port is None
+    assert norm_bad_sock.event_category == EventCategory.OTHER
+
+
+def test_auditd_adversarial_dispatch_multiarch_and_network_isolation():
+    """Verify dispatch precedence over generic EDR, multi-arch syscalls, and network isolation."""
+    t0 = datetime(2026, 10, 20, 10, 0, tzinfo=timezone.utc)
+    engine = NormalisationEngine()
+
+    # 1. Dispatch precedence: an auditd event with cmdline must NOT be claimed by GenericEDR
+    raw_disp = RawTelemetryEventV1(
+        raw_event_id="RAW-AUD-DISP-01",
+        source_event_id="AUD-DISP-1",
+        source_format="auditd",
+        source_timestamp=t0,
+        ingested_at=t0,
+        raw_payload={
+            "type": "SYSCALL",
+            "cmdline": "python3 /opt/app.py",
+            "syscall": "execve",
+            "success": "yes",
+            "exe": "/usr/bin/python3",
+            "node": "srv-linux",
+        },
+    )
+    norm_disp = engine.normalize(raw_disp)
+    assert norm_disp.event_category == EventCategory.PROCESS_CREATION
+
+    # 2. Multi-arch execve syscall numbers (e.g. ARM64 221, x86 11)
+    raw_arm64 = RawTelemetryEventV1(
+        raw_event_id="RAW-AUD-ARM-01",
+        source_event_id="AUD-ARM-1",
+        source_format="auditd",
+        source_timestamp=t0,
+        ingested_at=t0,
+        raw_payload={
+            "type": "SYSCALL",
+            "syscall": "221",  # ARM64 execve
+            "success": True,
+            "exe": "/bin/bash",
+            "node": "srv-arm64",
+        },
+    )
+    norm_arm64 = engine.normalize(raw_arm64)
+    assert norm_arm64.event_category == EventCategory.PROCESS_CREATION
+    assert norm_arm64.process_name == "bash"
+
+    # 3. Failed syscall with negative exit code (e.g. exit -13 = EACCES) without success field
+    raw_neg_exit = RawTelemetryEventV1(
+        raw_event_id="RAW-AUD-EXIT-01",
+        source_event_id="AUD-EXIT-1",
+        source_format="auditd",
+        source_timestamp=t0,
+        ingested_at=t0,
+        raw_payload={
+            "type": "SYSCALL",
+            "syscall": "execve",
+            "exit": -13,
+            "exe": "/bin/ls",
+            "node": "srv-linux",
+        },
+    )
+    norm_neg_exit = engine.normalize(raw_neg_exit)
+    assert norm_neg_exit.event_category == EventCategory.OTHER
+
+    # 4. Network destination isolation: non-network records (auth) must leave dest_ip=None and retain addr in extra
+    raw_auth_addr = RawTelemetryEventV1(
+        raw_event_id="RAW-AUD-AUTH-01",
+        source_event_id="AUD-AUTH-1",
+        source_format="auditd",
+        source_timestamp=t0,
+        ingested_at=t0,
+        raw_payload={
+            "type": "USER_AUTH",
+            "node": "srv-linux",
+            "acct": "admin",
+            "addr": "192.168.1.100",
+            "terminal": "ssh",
+        },
+    )
+    norm_auth = engine.normalize(raw_auth_addr)
+    assert norm_auth.event_category == EventCategory.AUTHENTICATION
+    assert norm_auth.network_destination_ip is None
+    assert norm_auth.network_destination_port is None
+    assert norm_auth.extra_attributes["addr"] == "192.168.1.100"
+
+    # 5. Unsupported sockaddr families: AF_INET6 (0a00) and AF_UNIX (0100)
+    raw_unix_sock = RawTelemetryEventV1(
+        raw_event_id="RAW-AUD-UNIX-01",
+        source_event_id="AUD-UNIX-1",
+        source_format="auditd",
+        source_timestamp=t0,
+        ingested_at=t0,
+        raw_payload={
+            "type": "SOCKADDR",
+            "node": "srv-linux",
+            "saddr": "01002f746d702f736f636b6574000000",  # AF_UNIX
+        },
+    )
+    norm_unix = engine.normalize(raw_unix_sock)
+    assert norm_unix.network_destination_ip is None
+    assert norm_unix.event_category == EventCategory.OTHER

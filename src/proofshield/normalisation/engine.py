@@ -353,10 +353,14 @@ class GenericEDRNormaliser(BaseNormaliser):
     }
 
     def can_handle(self, raw_event: RawTelemetryEventV1) -> bool:
-        fmt = raw_event.source_format.strip().lower()
+        fmt = (raw_event.source_format or "").strip().lower()
         if fmt in self.EDR_FORMATS:
             return True
+        if fmt in {"auditd", "linux_audit", "audit", "audit_log", "sysmon", "microsoft-windows-sysmon", "sysmon_json"}:
+            return False
         payload = raw_event.raw_payload
+        if "EventID" in payload or "syscall" in payload or "audit_id" in payload:
+            return False
         return any(k in payload for k in ("event_type", "action", "process_name", "cmdline"))
 
     def normalize(self, raw_event: RawTelemetryEventV1) -> NormalizedTelemetryEventV1:
@@ -472,6 +476,225 @@ class GenericEDRNormaliser(BaseNormaliser):
         )
 
 
+def _parse_auditd_sockaddr(saddr: Any) -> tuple[Optional[str], Optional[int]]:
+    """Parse Linux auditd hex-encoded sockaddr struct (AF_INET IPv4).
+
+    Format: 32 hex chars.
+    Bytes 0-1: family (0200 = AF_INET little-endian).
+    Bytes 2-3: port (network byte order / big endian).
+    Bytes 4-7: IPv4 address (network byte order).
+    """
+    if not isinstance(saddr, str):
+        return None, None
+    s = saddr.strip()
+    if len(s) == 32 and s[:4].lower() == "0200":
+        try:
+            port = int(s[4:8], 16)
+            b0 = int(s[8:10], 16)
+            b1 = int(s[10:12], 16)
+            b2 = int(s[12:14], 16)
+            b3 = int(s[14:16], 16)
+            if 0 <= port <= 65535 and all(0 <= b <= 255 for b in (b0, b1, b2, b3)):
+                return f"{b0}.{b1}.{b2}.{b3}", port
+        except ValueError:
+            return None, None
+    return None, None
+
+
+class AuditdNormaliser(BaseNormaliser):
+    """Normalises Linux auditd telemetry events into canonical events.
+
+    Adheres strictly to evidence sufficiency:
+    - Multi-record and fragmented records (e.g. CWD, PATH, PROCTITLE) without
+      process creation or network evidence map to EventCategory.OTHER.
+    - PROCESS_CREATION requires an execution syscall (execve/execveat),
+      success != false, and executable path or process name evidence.
+    - NETWORK_CONNECTION requires socket record/syscall with valid dest IP/port.
+    - AUTHENTICATION is mapped for USER_AUTH, USER_LOGIN, and LOGIN records.
+    - All unmapped attributes are safely preserved in extra_attributes.
+    """
+
+    AUDITD_FORMATS = {"auditd", "linux_audit", "audit", "audit_log"}
+
+    def can_handle(self, raw_event: RawTelemetryEventV1) -> bool:
+        fmt = (raw_event.source_format or "").strip().lower()
+        if fmt in self.AUDITD_FORMATS:
+            return True
+        p = raw_event.raw_payload
+        # Detect auditd record markers if source_format is not explicitly set
+        if any(k in p for k in ("syscall", "audit_id", "record_type", "ses", "auid")) and (
+            p.get("type") in {"SYSCALL", "EXECVE", "SOCKADDR", "USER_AUTH", "USER_LOGIN", "CWD", "PATH", "PROCTITLE"}
+            or "syscall" in p
+        ):
+            return True
+        return False
+
+    def normalize(self, raw_event: RawTelemetryEventV1) -> NormalizedTelemetryEventV1:
+        p = raw_event.raw_payload
+        src_id = (
+            _clean_str(p.get("audit_id"))
+            or _clean_str(p.get("serial"))
+            or _clean_str(raw_event.source_event_id)
+            or "unknown_event"
+        )
+        src_ts = _ensure_utc(raw_event.source_timestamp)
+
+        # Host
+        host = (
+            _clean_str(p.get("node"))
+            or _clean_str(p.get("host"))
+            or _clean_str(p.get("hostname"))
+            or _clean_str(p.get("computer"))
+            or "unknown_host"
+        )
+
+        # User
+        user = (
+            _clean_str(p.get("user"))
+            or _clean_str(p.get("acct"))
+            or _clean_str(p.get("username"))
+            or _clean_str(p.get("account"))
+        )
+        if not user and p.get("uid") is not None:
+            user = f"uid:{p['uid']}"
+
+        # Process Path and Name
+        proc_path = _clean_path(p.get("exe") or p.get("process_path") or p.get("binary_path"))
+        proc_name = _clean_str(p.get("comm") or p.get("process_name"))
+        if not proc_name and proc_path:
+            proc_name = _extract_basename(proc_path)
+        if not proc_path and not proc_name and "a0" in p:
+            a0_str = _clean_path(p.get("a0"))
+            if a0_str:
+                proc_path = a0_str
+                proc_name = _extract_basename(a0_str)
+
+        # Command Line
+        cmd_line = _clean_str(p.get("command_line") or p.get("cmdline") or p.get("proctitle"))
+        if not cmd_line:
+            args_field = p.get("args")
+            if isinstance(args_field, (list, tuple)):
+                cmd_line = " ".join(str(a) for a in args_field if a is not None).strip() or None
+            elif isinstance(args_field, str):
+                cmd_line = args_field.strip() or None
+        if not cmd_line:
+            collected_args = []
+            i = 0
+            while f"a{i}" in p:
+                val = p[f"a{i}"]
+                if val is not None:
+                    collected_args.append(str(val))
+                i += 1
+            if collected_args:
+                cmd_line = " ".join(collected_args).strip() or None
+
+        # Parent process
+        parent_name = _clean_str(p.get("parent_name") or p.get("parent_comm") or p.get("parent_process_name"))
+        parent_path = _clean_path(p.get("parent_exe") or p.get("parent_path"))
+        if not parent_name and parent_path:
+            parent_name = _extract_basename(parent_path)
+        parent_cmd = _clean_str(p.get("parent_cmdline") or p.get("parent_cmd"))
+
+        # Hashes
+        hashes = _parse_hashes(p.get("hashes"))
+        for hash_field in ("sha256", "md5", "sha1"):
+            if hash_field not in hashes and hash_field in p:
+                field_val = _clean_str(p.get(hash_field))
+                if field_val and field_val.lower() not in _HASH_IGNORE_VALUES:
+                    hashes[hash_field] = field_val.lower()
+
+        # Network
+        sock_ip, sock_port = _parse_auditd_sockaddr(p.get("saddr"))
+        dest_ip = sock_ip or _clean_str(p.get("destination_ip") or p.get("dst_ip") or p.get("remote_ip"))
+        dest_port = sock_port
+        if dest_port is None:
+            for port_key in ("destination_port", "dst_port", "remote_port", "port"):
+                if port_key in p:
+                    parsed_port = _parse_port(p[port_key])
+                    if parsed_port is not None:
+                        dest_port = parsed_port
+                        break
+
+        # Category determination
+        rec_type = (_clean_str(p.get("type") or p.get("record_type")) or "").upper()
+        syscall = (_clean_str(p.get("syscall")) or "").lower()
+
+        # Check execution success
+        success_val = p.get("success")
+        is_success = True
+        if success_val is not None:
+            if isinstance(success_val, bool):
+                is_success = success_val
+            elif isinstance(success_val, (int, float)):
+                is_success = bool(success_val)
+            elif isinstance(success_val, str):
+                is_success = success_val.strip().lower() not in {"no", "false", "0", "fail", "failed"}
+        exit_val = p.get("exit")
+        if exit_val is not None:
+            try:
+                if int(exit_val) < 0:
+                    is_success = False
+            except (ValueError, TypeError):
+                pass
+
+        category = EventCategory.OTHER
+        exec_syscalls = {"execve", "execveat", "59", "322", "11", "358", "221", "281"}
+        net_syscalls = {"connect", "accept", "accept4", "42", "43", "288", "202", "203", "242", "102"}
+        is_exec_call = syscall in exec_syscalls or rec_type == "EXECVE"
+
+        if is_exec_call and is_success and (proc_path or proc_name):
+            category = EventCategory.PROCESS_CREATION
+        elif rec_type == "SOCKADDR" or syscall in net_syscalls:
+            if dest_ip or dest_port is not None:
+                category = EventCategory.NETWORK_CONNECTION
+        elif rec_type in {"USER_AUTH", "USER_LOGIN", "LOGIN", "CRED_ACQ", "CRED_DISP"}:
+            category = EventCategory.AUTHENTICATION
+        elif rec_type in {"PATH", "FILE"} and (
+            str(p.get("nametype") or "").strip().upper() in {"CREATE", "DELETE"} or syscall in {"unlink", "unlinkat", "rmdir", "rename", "renameat", "renameat2"}
+        ):
+            category = EventCategory.FILE_EVENT
+
+        # Strictly gate destination IP and port to NETWORK_CONNECTION events
+        if category != EventCategory.NETWORK_CONNECTION:
+            dest_ip = None
+            dest_port = None
+
+        known_keys = {
+            "type", "record_type", "syscall", "audit_id", "serial", "node", "host",
+            "hostname", "computer", "user", "acct", "username", "account", "uid",
+            "exe", "process_path", "binary_path", "comm", "process_name", "command_line",
+            "cmdline", "proctitle", "args", "parent_name", "parent_comm", "parent_process_name",
+            "parent_exe", "parent_path", "parent_cmdline", "parent_cmd", "hashes", "sha256",
+            "md5", "sha1", "saddr", "destination_ip", "dst_ip", "remote_ip",
+            "destination_port", "dst_port", "remote_port", "port", "success", "execution_token",
+            "token", "proofshield_token",
+        }
+        extra = {k: v for k, v in p.items() if k not in known_keys and not (k.startswith("a") and k[1:].isdigit())}
+
+        token = extract_execution_token(p, text_fields=[cmd_line, proc_path, p.get("proctitle")])
+
+        return NormalizedTelemetryEventV1(
+            normalized_event_id=f"NORM-{uuid.uuid4().hex[:12].upper()}",
+            raw_event_id=raw_event.raw_event_id,
+            source_event_id=src_id,
+            source_timestamp=src_ts,
+            normalized_timestamp=src_ts,
+            event_category=category,
+            host=host,
+            user=user,
+            process_name=proc_name,
+            process_path=proc_path,
+            command_line=cmd_line,
+            parent_process_name=parent_name,
+            parent_command_line=parent_cmd,
+            hashes=hashes,
+            network_destination_ip=dest_ip,
+            network_destination_port=dest_port,
+            execution_token=token,
+            extra_attributes=extra,
+        )
+
+
 class FallbackNormaliser(BaseNormaliser):
     """Guaranteed fallback normaliser for unknown telemetry schemas.
 
@@ -543,6 +766,7 @@ class NormalisationEngine:
     def __init__(self, normalisers: Optional[List[BaseNormaliser]] = None):
         self.normalisers: List[BaseNormaliser] = normalisers or [
             SysmonNormaliser(),
+            AuditdNormaliser(),
             GenericEDRNormaliser(),
             FallbackNormaliser(),
         ]

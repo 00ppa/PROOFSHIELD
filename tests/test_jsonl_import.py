@@ -147,3 +147,12 @@ def test_validate_raw_telemetry_realistic_fixture(raw_telemetry_realistic_path: 
     assert report.valid_count == 3
     assert report.error_count == 0
     assert len(report.records) == 3
+
+
+def test_validate_raw_telemetry_auditd_fixture(raw_telemetry_auditd_path: Path):
+    """Verify raw_telemetry_auditd_v1.jsonl parses all 5 synthetic auditd events cleanly."""
+    report = validate_jsonl_file(raw_telemetry_auditd_path, RawTelemetryEventV1)
+    assert report.is_valid is True
+    assert report.valid_count == 5
+    assert report.error_count == 0
+    assert len(report.records) == 5
