@@ -5,6 +5,7 @@ Evaluates test runs against scenario expectations using collected evidence
 and classifies outcomes into one of seven diagnostic categories.
 """
 
+import ipaddress
 import re
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -24,6 +25,150 @@ from proofshield.schemas.scenario import ScenarioV1
 from proofshield.schemas.telemetry import NormalizedTelemetryEventV1
 from proofshield.schemas.test_run import TestRunV1
 from proofshield.services.store import InMemoryStore, hosts_match
+
+
+def _ip_matches(expected: str, candidate: Optional[str]) -> bool:
+    """Compare expected and candidate IP addresses supporting IPv4 and IPv6 canonicalization."""
+    if not expected or not candidate:
+        return False
+    exp_clean = expected.strip()
+    cand_clean = candidate.strip()
+    if exp_clean.lower() == cand_clean.lower():
+        return True
+    try:
+        exp_obj = ipaddress.ip_address(exp_clean)
+        cand_obj = ipaddress.ip_address(cand_clean)
+        return exp_obj == cand_obj
+    except ValueError:
+        return exp_clean.lower() == cand_clean.lower()
+
+
+def _path_matches(expected: str, candidate: str) -> bool:
+    """Compare expected and candidate file paths safely across Windows and POSIX boundaries.
+
+    Prevents false substring collisions such as '/etc/hosts.bak' matching '/etc/hosts'
+    while supporting basename matching, relative path matching, and explicit regex.
+    """
+    if not expected or not candidate:
+        return False
+
+    exp_clean = expected.strip()
+    cand_clean = candidate.strip()
+
+    # Normalize directory separators and lower-case
+    exp_norm = exp_clean.replace("\\", "/").rstrip("/").lower()
+    cand_norm = cand_clean.replace("\\", "/").rstrip("/").lower()
+
+    if not exp_norm or not cand_norm:
+        return False
+
+    # 1. Exact normalized match
+    if exp_norm == cand_norm:
+        return True
+
+    # 2. Check component suffix match at a path separator boundary
+    # e.g. candidate="c:/windows/system32/drivers/etc/hosts", expected="etc/hosts"
+    # or candidate="/etc/hosts", expected="hosts"
+    if cand_norm.endswith(exp_norm):
+        prefix_len = len(cand_norm) - len(exp_norm)
+        if prefix_len > 0 and cand_norm[prefix_len - 1] in ("/", ":"):
+            if exp_norm.startswith("/"):
+                prefix = cand_norm[:prefix_len]
+                # If expected was an absolute path starting with '/', only allow drive prefix or root
+                if prefix in ("/", "") or (len(prefix) == 2 and prefix[1] == ":") or (len(prefix) == 3 and prefix[1] == ":" and prefix[2] == "/"):
+                    return True
+                return False
+            return True
+
+    # 3. Handle Windows drive letter variance: expected="c:/etc/hosts", candidate="/etc/hosts"
+    if len(exp_norm) >= 3 and exp_norm[1] == ":" and exp_norm[2] == "/":
+        exp_no_drive = exp_norm[2:]
+        if cand_norm == exp_no_drive:
+            return True
+
+    # 4. If expected explicitly uses regex metacharacters, attempt regex matching
+    regex_metachars = set(r"*+?[](){}^$")
+    if any(c in regex_metachars for c in exp_clean):
+        try:
+            if re.search(exp_clean, cand_clean, re.IGNORECASE):
+                return True
+        except re.error:
+            pass
+
+    return False
+
+
+def _hash_matches(expected: str, event_hashes: Optional[Dict[str, str]]) -> bool:
+    """Match expected file hash against event hashes, supporting algorithm prefixes and raw digests."""
+    if not expected or not event_hashes:
+        return False
+
+    exp_clean = expected.strip().lower()
+
+    algo_specified = None
+    expected_digest = exp_clean
+    for sep in (":", "="):
+        if sep in exp_clean:
+            parts = exp_clean.split(sep, 1)
+            algo_cand = parts[0].strip()
+            if algo_cand in {"sha256", "md5", "sha1", "imphash"}:
+                algo_specified = algo_cand
+                expected_digest = parts[1].strip()
+                break
+
+    # If algorithm was explicitly specified, check only that specific algorithm key
+    if algo_specified:
+        actual_val = event_hashes.get(algo_specified)
+        if actual_val and str(actual_val).strip().lower() == expected_digest:
+            return True
+        return False
+
+    # Otherwise, check all hash entries in event_hashes
+    for k, v in event_hashes.items():
+        v_clean = str(v).strip().lower()
+        if v_clean == expected_digest:
+            return True
+        for sep in (":", "="):
+            if sep in v_clean:
+                v_parts = v_clean.split(sep, 1)
+                if v_parts[1].strip() == expected_digest:
+                    return True
+
+    return False
+
+
+def _parse_user_domain(user_str: str) -> Tuple[Optional[str], str]:
+    """Split user string into (domain, username). Supports DOMAIN\\user and user@domain."""
+    clean = user_str.strip().lower()
+    if "\\" in clean:
+        parts = clean.split("\\", 1)
+        return parts[0], parts[1]
+    if "@" in clean:
+        parts = clean.split("@", 1)
+        return parts[1], parts[0]
+    return None, clean
+
+
+def _user_matches(expected: str, candidate: Optional[str]) -> bool:
+    """Match expected user against candidate identity.
+
+    Prevents cross-domain collisions (e.g. CORPA\\alice != CORPB\\alice) while
+    allowing bare username matching if domain is not specified by either party.
+    """
+    if not expected or not candidate:
+        return False
+
+    exp_domain, exp_user = _parse_user_domain(expected)
+    cand_domain, cand_user = _parse_user_domain(candidate)
+
+    if exp_user != cand_user:
+        return False
+
+    # If both specified domains, both domains must match
+    if exp_domain and cand_domain:
+        return exp_domain == cand_domain
+
+    return True
 
 
 def _is_in_window(ts: Optional[datetime], w_start: datetime, w_end: datetime) -> bool:
@@ -301,10 +446,63 @@ class AssuranceEngine:
             )
 
         # ── Step 3: Find events matching expected telemetry ──────────────
-        matching_events = self._find_matching_events(scenario, events)
         all_evidence_ids = [e.normalized_event_id for e in events]
 
+        # Guard: Check whether scenario defines a discriminating signature
+        # An attack-detection scenario (EXPECTED_ALERT) without a discriminating signature
+        # cannot be causally linked to alerts and would produce false passes on ambient noise.
+        if scenario.validation_target == ValidationTarget.EXPECTED_ALERT and not scenario.has_discriminating_signature():
+            return self._make_result(
+                run=run,
+                scenario=scenario,
+                category=DiagnosticCategory.INCONCLUSIVE,
+                reason=(
+                    f"Scenario '{scenario.scenario_id}' lacks a discriminating signature for "
+                    f"{scenario.expected_event_category.value}; cannot distinguish tested activity "
+                    f"from ambient background telemetry"
+                ),
+                confidence="uncertain",
+                supporting_evidence=all_evidence_ids,
+                diagnostic_reasons=[
+                    f"Expected category: {scenario.expected_event_category.value}",
+                    "Scenario provides no discriminating fields (process, command, IP, port, path, hash, or user)",
+                    f"Events in window: {len(events)} (cannot be causally attributed without discriminating signature)",
+                ],
+                metadata={
+                    "missing_evidence": True,
+                    "underspecified_scenario": True,
+                    "attribution": self._build_attribution_metadata(
+                        run_token=run_token,
+                        status=AttributionStatus.INCONCLUSIVE.value if is_strict else AttributionStatus.NOT_REQUESTED.value,
+                        is_strict=is_strict,
+                        events=events,
+                        notes=["Underspecified scenario lacks discriminating signature"],
+                    ),
+                },
+            )
+
+        matching_events = self._find_matching_events(scenario, events)
+
         if not matching_events:
+            diag_reasons = [
+                f"Expected category: {scenario.expected_event_category.value}",
+                f"Expected process: {scenario.expected_process_name or 'any'}",
+                f"Expected pattern: {scenario.expected_command_pattern or 'any'}",
+            ]
+            if scenario.expected_destination_ip:
+                diag_reasons.append(f"Expected destination IP: {scenario.expected_destination_ip}")
+            if scenario.expected_destination_port is not None:
+                diag_reasons.append(f"Expected destination port: {scenario.expected_destination_port}")
+            if scenario.expected_file_path:
+                diag_reasons.append(f"Expected file path: {scenario.expected_file_path}")
+            if scenario.expected_file_hash:
+                diag_reasons.append(f"Expected file hash: {scenario.expected_file_hash}")
+            if scenario.expected_user:
+                diag_reasons.append(f"Expected user: {scenario.expected_user}")
+            diag_reasons.extend([
+                f"Events in window: {len(events)} (none matched)",
+                "Note: absence does not confirm the event was never generated",
+            ])
             return self._make_result(
                 run=run,
                 scenario=scenario,
@@ -314,13 +512,7 @@ class AssuranceEngine:
                 ),
                 confidence="likely",
                 supporting_evidence=all_evidence_ids,
-                diagnostic_reasons=[
-                    f"Expected category: {scenario.expected_event_category.value}",
-                    f"Expected process: {scenario.expected_process_name or 'any'}",
-                    f"Expected pattern: {scenario.expected_command_pattern or 'any'}",
-                    f"Events in window: {len(events)} (none matched)",
-                    "Note: absence does not confirm the event was never generated",
-                ],
+                diagnostic_reasons=diag_reasons,
                 metadata={
                     "attribution": self._build_attribution_metadata(
                         run_token=run_token,
@@ -920,33 +1112,75 @@ class AssuranceEngine:
         """Find events matching the scenario's expected telemetry signature."""
         matched = []
         for event in events:
-            # Category must match
+            # 1. Category must match
             if event.event_category != scenario.expected_event_category:
                 continue
 
-            # Process name check (case-insensitive) if specified
-            if scenario.expected_process_name:
+            # 2. Process name check (case-insensitive) if specified
+            # 2. Process name check if specified
+            if scenario.expected_process_name and scenario.expected_process_name.strip():
                 if not event.process_name:
                     continue
                 if (
-                    event.process_name.lower()
-                    != scenario.expected_process_name.lower()
+                    event.process_name.strip().lower()
+                    != scenario.expected_process_name.strip().lower()
                 ):
                     continue
 
-            # Command pattern check if specified
-            if scenario.expected_command_pattern:
+            # 3. Command pattern check if specified
+            if scenario.expected_command_pattern and scenario.expected_command_pattern.strip():
                 if not event.command_line:
                     continue
+                exp_pat = scenario.expected_command_pattern.strip()
                 try:
-                    if not re.search(
-                        scenario.expected_command_pattern, event.command_line
-                    ):
+                    if not re.search(exp_pat, event.command_line):
                         continue
                 except re.error:
                     # If the pattern is not valid regex, try substring match
-                    if scenario.expected_command_pattern not in event.command_line:
+                    if exp_pat not in event.command_line:
                         continue
+
+            # 4. Network destination IP check if specified
+            if scenario.expected_destination_ip and scenario.expected_destination_ip.strip():
+                if not _ip_matches(scenario.expected_destination_ip, event.network_destination_ip):
+                    continue
+
+            # 5. Network destination port check if specified
+            if scenario.expected_destination_port is not None:
+                if event.network_destination_port is None:
+                    continue
+                if event.network_destination_port != scenario.expected_destination_port:
+                    continue
+
+            # 6. File path check if specified
+            if scenario.expected_file_path and scenario.expected_file_path.strip():
+                # Prioritize target file attributes if present (e.g. on file events or logging that separates process from target file)
+                target_paths = [
+                    str(event.extra_attributes[k])
+                    for k in ("TargetFilename", "file_path", "path", "target_filename", "filename", "name", "FilePath", "TargetFilePath")
+                    if k in event.extra_attributes and event.extra_attributes[k]
+                ]
+
+                if target_paths:
+                    candidate_paths = target_paths
+                else:
+                    candidate_paths = [p for p in (event.process_path, event.process_name) if p]
+
+                if not candidate_paths:
+                    continue
+
+                if not any(_path_matches(scenario.expected_file_path, cpath) for cpath in candidate_paths):
+                    continue
+
+            # 7. File hash check if specified
+            if scenario.expected_file_hash and scenario.expected_file_hash.strip():
+                if not _hash_matches(scenario.expected_file_hash, event.hashes):
+                    continue
+
+            # 8. User check if specified
+            if scenario.expected_user and scenario.expected_user.strip():
+                if not _user_matches(scenario.expected_user, event.user):
+                    continue
 
             matched.append(event)
 

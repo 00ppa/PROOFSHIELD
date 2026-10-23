@@ -47,6 +47,28 @@ class ScenarioV1(ProofshieldBaseModel):
         None,
         description="Regex pattern or substring expected in command-line arguments",
     )
+    expected_destination_ip: Optional[str] = Field(
+        None,
+        description="Expected destination IP address for network telemetry",
+    )
+    expected_destination_port: Optional[int] = Field(
+        None,
+        ge=0,
+        le=65535,
+        description="Expected destination network port [0-65535]",
+    )
+    expected_file_path: Optional[str] = Field(
+        None,
+        description="Expected file path, target filename, or regex/substring pattern for file telemetry",
+    )
+    expected_file_hash: Optional[str] = Field(
+        None,
+        description="Expected cryptographic file hash (e.g. SHA256 or MD5)",
+    )
+    expected_user: Optional[str] = Field(
+        None,
+        description="Expected user account, username, or UID",
+    )
     max_acceptable_latency_seconds: int = Field(
         300,
         ge=1,
@@ -62,6 +84,27 @@ class ScenarioV1(ProofshieldBaseModel):
         default_factory=dict,
         description="Arbitrary tags, author info, environment prerequisites",
     )
+
+    def has_discriminating_signature(self) -> bool:
+        """Check whether the scenario defines at least one discriminating signature field.
+
+        A scenario without any discriminating signature field cannot be reliably
+        distinguished from ambient background noise of the same event category.
+        """
+        def _has_value(val: Optional[str]) -> bool:
+            return bool(val and val.strip())
+
+        return any(
+            [
+                _has_value(self.expected_process_name),
+                _has_value(self.expected_command_pattern),
+                _has_value(self.expected_destination_ip),
+                self.expected_destination_port is not None,
+                _has_value(self.expected_file_path),
+                _has_value(self.expected_file_hash),
+                _has_value(self.expected_user),
+            ]
+        )
 
     @property
     def ground_truth_label(self) -> ValidationTarget:

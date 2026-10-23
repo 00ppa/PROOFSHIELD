@@ -5,9 +5,10 @@ operations and time-window-based event correlation. Will be replaced by
 PostgreSQL-backed storage when the core data model stabilises.
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import ipaddress
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, Generator, List, Optional, Union
 
 from proofshield.normalisation.engine import extract_execution_token
 from proofshield.schemas.alert import AlertV1
@@ -89,6 +90,35 @@ class InMemoryStore:
         self._alerts.clear()
         self._results.clear()
         self._ground_truths.clear()
+
+    @contextmanager
+    def transaction(self) -> Generator[None, None, None]:
+        """Context manager for atomic transaction management.
+
+        Snapshots store state and rolls back all mutations if an exception occurs.
+        """
+        snapshot = {
+            "scenarios": dict(self._scenarios),
+            "runs": dict(self._runs),
+            "raw_events": dict(self._raw_events),
+            "normalized_events": dict(self._normalized_events),
+            "rules": dict(self._rules),
+            "alerts": dict(self._alerts),
+            "results": dict(self._results),
+            "ground_truths": dict(self._ground_truths),
+        }
+        try:
+            yield
+        except Exception:
+            self._scenarios = snapshot["scenarios"]
+            self._runs = snapshot["runs"]
+            self._raw_events = snapshot["raw_events"]
+            self._normalized_events = snapshot["normalized_events"]
+            self._rules = snapshot["rules"]
+            self._alerts = snapshot["alerts"]
+            self._results = snapshot["results"]
+            self._ground_truths = snapshot["ground_truths"]
+            raise
 
     # ── Scenarios ─────────────────────────────────────────────────────────
 

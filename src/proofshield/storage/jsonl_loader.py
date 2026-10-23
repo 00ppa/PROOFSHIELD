@@ -23,6 +23,7 @@ class JSONLValidationReport(BaseModel, Generic[T]):
     error_count: int = 0
     errors: List[JSONLLineError] = []
     records: List[T] = []
+    record_line_numbers: List[int] = []
 
     @property
     def is_valid(self) -> bool:
@@ -119,6 +120,7 @@ def validate_jsonl_stream(
         try:
             record = schema_cls.model_validate(data)
             report.records.append(record)
+            report.record_line_numbers.append(idx)
             report.valid_count += 1
         except ValidationError as exc:
             report.error_count += 1

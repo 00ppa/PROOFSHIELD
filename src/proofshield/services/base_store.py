@@ -5,7 +5,7 @@ must satisfy for deterministic evaluation and entity management.
 """
 
 from datetime import datetime, timezone
-from typing import List, Optional, Protocol, runtime_checkable
+from typing import Any, List, Optional, Protocol, runtime_checkable
 
 from proofshield.schemas.alert import AlertV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
@@ -37,6 +37,10 @@ class StoreProtocol(Protocol):
 
     def reset(self) -> None:
         """Clear all stored data. Used for test isolation."""
+        ...
+
+    def transaction(self) -> Any:
+        """Context manager for atomic transaction management."""
         ...
 
     # ── Scenarios ─────────────────────────────────────────────────────────

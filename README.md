@@ -4,7 +4,7 @@
 
 - **Author & Maintainer**: FS ([@00ppa](https://github.com/00ppa))
 - **Status**: Research Prototype (v0.1.0)
-- **Test Suite**: 110/110 passing automated tests across 10 modules (0.3s runtime)
+- **Test Suite**: 321/321 passing automated tests across 21 modules (4.5s runtime)
 - **Benchmark**: 25 controlled benchmark scenarios (BM-01 to BM-25) + 12-case fault matrix (FT-01 to FT-12)
 - **Architecture Specification**: Detailed specifications in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
@@ -32,7 +32,13 @@
    The telemetry normalisation layer guarantees that original raw identifiers (`raw_event_id`, `source_event_id`) and timestamps (`source_timestamp`) are preserved intact across Sysmon, generic EDR, and fallback formats.
 
 5. **Local-First & Zero Paid Dependencies**:
-   Built natively on Python 3.12, FastAPI, Pydantic v2, and pytest. Evaluates entirely in-memory without requiring external cloud accounts or paid vendor APIs.
+   Built natively on Python 3.12, FastAPI, Pydantic v2, and pytest. Evaluates entirely in-memory or with local SQLite storage without requiring external cloud accounts or paid vendor APIs.
+
+6. **Multidimensional Evidence Signatures & False-PASS Prevention**:
+   Extends scenario validation contracts beyond process names to network connections (`expected_destination_ip`, `expected_destination_port`), file modifications (`expected_file_path`, `expected_file_hash`), and user identities (`expected_user`). Underspecified attack scenarios lacking discriminating signatures are prevented from falsely passing on ambient background activity, deterministically returning `INCONCLUSIVE`.
+
+7. **Opt-In API Telemetry Persistence Bridge**:
+   Provides explicit, safe telemetry persistence across REST ingestion routes (`POST /api/v1/telemetry/raw`, `POST /api/v1/telemetry/normalize`, `POST /api/v1/ingest/jsonl`) via `store=true` (default: `store=false`). Supports fault-isolated streaming JSONL batch import with accurate line-level error reporting, atomic all-or-nothing transactions via `atomic=true`, and full parity across both in-memory and persistent SQLite storage backends.
 
 ---
 
@@ -171,18 +177,29 @@ PROOFSHIELD/
 │       │   └── store.py                # Layer 2 In-memory entity store & correlation engine
 │       └── storage/                    # Layer 2 Streaming JSONL
 │           └── jsonl_loader.py         # Streaming JSONL reader & schema validator
-├── tests/                              # Comprehensive test suite (110 tests)
+├── tests/                              # Comprehensive test suite (314 tests across 21 modules)
 │   ├── conftest.py                     # Shared pytest fixtures
-│   ├── test_api_endpoints.py           # 12 tests: REST API contracts & evaluation routes
-│   ├── test_benchmark.py               # 6 tests: 25-case benchmark suite (BM-01 to BM-25)
-│   ├── test_evaluation.py              # 19 tests: Layer 5 Assurance Engine core logic
-│   ├── test_fault_matrix.py            # 12 tests: Phase 2 Fault-Injection Matrix (FT-01 to FT-12)
-│   ├── test_health.py                  # 2 tests: Health check probes
-│   ├── test_jsonl_import.py            # 8 tests: JSONL parsing & streaming validation
-│   ├── test_normalisation.py           # 5 tests: Telemetry normalisers & attribute preservation
-│   ├── test_schemas.py                 # 11 tests: Schema validation & constraint enforcement
-│   ├── test_store.py                   # 10 tests: Entity store CRUD, host matching & indexing
-│   └── test_token_attribution.py       # 25 tests: Execution-token attribution & strict verification
+│   ├── test_api_endpoints.py           # REST API contracts & evaluation routes
+│   ├── test_api_sqlite.py              # SQLite API integration & persistence tests
+│   ├── test_api_telemetry_persistence.py# 15 tests: API telemetry persistence bridge & atomic transactions
+│   ├── test_benchmark.py               # Benchmark runner & dataset verification
+│   ├── test_benchmark_framework.py     # 25-case benchmark suite (BM-01 to BM-25)
+│   ├── test_evaluation.py              # Layer 5 Assurance Engine core evaluation logic
+│   ├── test_evidence_integrity.py      # Telemetry evidence immutability & provenance
+│   ├── test_fault_matrix.py            # Fault-Injection Matrix (FT-01 to FT-12)
+│   ├── test_health.py                  # Health check probes
+│   ├── test_jsonl_import.py            # JSONL streaming parsing, error isolation & serialization
+│   ├── test_multidimensional_signatures.py# 23 tests: IP, port, path, hash, user, underspecified guards & adversarial regression tests
+│   ├── test_normalisation.py           # Sysmon, Generic EDR, auditd & fallback normalisers
+│   ├── test_operational_hardening.py   # Boundary conditions, timeouts & edge cases
+│   ├── test_schemas.py                 # Pydantic v2 schema validation & constraint enforcement
+│   ├── test_sqlite_audit.py            # SQLite pragma & schema audits
+│   ├── test_sqlite_parity.py           # Relational vs in-memory operational parity
+│   ├── test_sqlite_store.py            # SQLiteStore CRUD & connection management
+│   ├── test_storage_configuration.py   # Pluggable backend environment selection
+│   ├── test_store.py                   # In-memory entity store CRUD, indexing & host matching
+│   ├── test_store_contract.py          # Formal StoreProtocol contract validation across backends
+│   └── test_token_attribution.py       # Execution-token attribution & strict verification
 ├── pyproject.toml                      # Standard Python packaging configuration
 ├── requirements.txt                    # Pinned core and dev dependencies
 └── README.md                           # Platform documentation and local instructions

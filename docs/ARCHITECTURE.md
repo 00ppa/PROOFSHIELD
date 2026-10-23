@@ -90,21 +90,23 @@ flowchart TD
 
 #### Layer 1: Versioned Data Schemas (`src/proofshield/schemas/`)
 Implements Pydantic v2 schemas enforcing strict validation:
-- **`ScenarioV1`**: Defines adversary behavior under test (MITRE ATT&CK technique and tactic), expected event category, expected process name/command pattern regex, target detection rule ID, acceptable latency, and validation target (`EXPECTED_ALERT`, `EXPECTED_TELEMETRY_ONLY`, `EXPECTED_BENIGN`).
+- **`ScenarioV1`**: Defines adversary behavior under test (MITRE ATT&CK technique and tactic), expected event category, expected process name/command pattern regex, multidimensional signature criteria (`expected_destination_ip`, `expected_destination_port`, `expected_file_path`, `expected_file_hash`, `expected_user`), `has_discriminating_signature()` guard, target detection rule ID, acceptable latency, and validation target (`EXPECTED_ALERT`, `EXPECTED_TELEMETRY_ONLY`, `EXPECTED_BENIGN`).
 - **`TestRunV1`**: Execution record defining target endpoint/user, time window (`window_start`, `window_end`), execution status, optional `execution_token`, and execution provenance (`is_synthetic`).
-- **`RawTelemetryEventV1`**: Immutable evidence container preserving the original payload dictionary, `source_event_id`, and `source_timestamp`.
-- **`NormalizedTelemetryEventV1`**: Canonical schema (`PROCESS_CREATION`, `NETWORK_CONNECTION`, etc.) with mapped process, hash, and network fields while strictly maintaining references to `raw_event_id`, preserved `source_event_id`, original `source_timestamp`, and extracted `execution_token`.
+- **`RawTelemetryEventV1`**: Immutable evidence container preserving the original payload dictionary, `source_event_id`, `source_timestamp`, and `ingested_at`.
+- **`NormalizedTelemetryEventV1`**: Canonical schema (`PROCESS_CREATION`, `NETWORK_CONNECTION`, `FILE_EVENT`, `AUTHENTICATION`, etc.) with mapped process, hash, and network fields while strictly maintaining references to `raw_event_id`, preserved `source_event_id`, original `source_timestamp`, and extracted `execution_token`.
 - **`DetectionRuleV1`**: Versioned detection rule record tracking rule formats (Sigma, Wazuh, Splunk), content hashes, and target evaluation backends.
 - **`AlertV1`**: Security monitoring alert record correlated to test runs by host (supporting NetBIOS and FQDN) and temporal window.
 - **`DiagnosticResultV1`**: Deterministic verdict classifying outcomes into one of the 7 diagnostic categories, with `confidence` level, detailed `diagnostic_reasons`, explicit lists of `supporting_evidence_ids` and `contradictory_evidence_ids`, and attribution metadata.
 - **`GroundTruthV1`**: Independently authored expectation records for measuring diagnostic classification accuracy against controlled attack executions or fault injections.
 
-#### Layer 2: Ingestion & Storage (`src/proofshield/storage/`, `src/proofshield/services/store.py`)
-- **Streaming JSONL Loader**: Line-isolated parsing (`validate_jsonl_stream`, `validate_jsonl_file`). Malformed lines produce structured line-error diagnostics without aborting valid lines.
-- **`InMemoryStore`**: Fast in-memory entity registry with indexed collections. Provides host matching (`hosts_match`) supporting case-insensitivity, FQDN suffix normalization, and IP matching guards.
+#### Layer 2: Ingestion & Storage (`src/proofshield/storage/`, `src/proofshield/services/`)
+- **Streaming JSONL Loader**: Line-isolated parsing (`validate_jsonl_stream`, `validate_jsonl_file`) recording line numbers on parsed records and isolating syntax/schema failures without aborting the stream.
+- **`StoreProtocol`**: Formal storage contract implemented by both backends, defining synchronous entity CRUD, time-window and host correlation queries, and atomic `transaction()` context management.
+- **`InMemoryStore`**: Fast in-memory entity store providing time-window event correlation, host matching (`hosts_match`) supporting case-insensitivity, FQDN suffix normalization, and snapshot-rollback transaction isolation.
+- **`SQLiteStore`**: Enterprise local persistence using WAL journal mode, explicit foreign key enforcement, multi-column indexes (`EXPLAIN QUERY PLAN` verified), and re-entrant savepoint transactions.
 
 #### Layer 3: Telemetry Normalisation (`src/proofshield/normalisation/`)
-- **Plugin Normalisation Engine**: Dispatches raw events to registered normalisers (`SysmonNormaliser`, `GenericEDRNormaliser`, `FallbackNormaliser`).
+- **Plugin Normalisation Engine**: Dispatches raw events to registered normalisers (`SysmonNormaliser`, `GenericEDRNormaliser`, `AuditdNormaliser`, `FallbackNormaliser`).
 - **Attribute Preservation**: Enforces zero loss of raw identifiers and original timestamps.
 - **Token Extraction**: `extract_execution_token` inspects structured payload fields first, then searches unstructured command lines and text fields using regex patterns. If conflicting candidate tokens are detected, the token is permanently flagged as `CONFLICT` to prevent false attribution.
 
@@ -153,8 +155,9 @@ flowchart TD
 #### Layer 6: Interfaces (`src/proofshield/api/`, `scripts/`)
 - **FastAPI Endpoints**:
   - `GET /health`, `GET /api/v1/health`: System health and schema catalogue.
-  - `POST /api/v1/telemetry/raw`: Ingest raw telemetry records.
-  - `POST /api/v1/telemetry/normalize`: Ingest and normalise raw events.
+  - `POST /api/v1/telemetry/raw`: Ingest raw telemetry records with opt-in persistence (`?store=true`).
+  - `POST /api/v1/telemetry/normalize`: Ingest and normalise raw events with opt-in persistence (`?store=true`).
+  - `POST /api/v1/ingest/jsonl`: Streaming JSONL dataset validation and ingestion (`store: bool`, `atomic: bool`).
   - `POST /api/v1/evaluation/{run_id}`: Trigger deterministic diagnostic evaluation (supports `?strict_attribution=true`).
 - **Interactive Terminal Demo**: `scripts/demo.py` provides standalone verification of nominal passes and failure modes in < 3ms.
 
@@ -215,4 +218,4 @@ All benchmark suites (`tests/test_benchmark.py` BM-01 to BM-25 and `tests/test_f
 ### Explicit Research Non-Claims
 1. **No Live SOC Adoption Claim**: PROOFSHIELD has been developed and evaluated locally against synthetic and emulated datasets. It does not currently claim deployment or validation across active production commercial Security Operations Centers (SOCs).
 2. **Provenance vs. Cryptographic Proof**: Execution-token attribution provides strong execution provenance and correlation safeguards. It does **not** claim cryptographic non-repudiation or formal philosophical causality (e.g., in the Pearl/counterfactual sense).
-3. **Local-First Boundary**: Current storage (`InMemoryStore`) operates in memory. Persistent multi-tenant storage (e.g., SQLite or PostgreSQL) represents future production engineering.
+3. **Pluggable Storage Boundary**: PROOFSHIELD provides dual first-class storage backends: fast `InMemoryStore` for ephemeral unit testing and production-grade local `SQLiteStore` (with WAL mode, foreign keys, and indexes) for persistent multi-run workflows. Distributed cloud storage (e.g., PostgreSQL or CockroachDB) represents future enterprise clustering.
