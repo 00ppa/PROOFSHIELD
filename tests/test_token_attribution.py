@@ -1384,3 +1384,213 @@ def test_undated_alert_without_token_does_not_make_run_inconclusive(base_setup):
     res_default = engine.evaluate_run(run.run_id, strict_attribution=False)
     assert res_default.predicted_category == DiagnosticCategory.DETECTION_NOT_TRIGGERED
     assert res_default.predicted_category != DiagnosticCategory.INCONCLUSIVE
+
+
+def test_strict_attribution_rejects_whitespace_run_and_alert_tokens(base_setup):
+    """Adversarial: Whitespace-only execution tokens on runs and alerts must not produce false PASS."""
+    store, scn, rule, t0 = base_setup
+
+    # Case 1: Run with whitespace-only execution token
+    run_ws = TestRunV1(
+        run_id="RUN-WS-TOKEN-01",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token="   ",  # Whitespace-only token
+    )
+    store.add_run(run_ws)
+
+    engine = AssuranceEngine(store)
+    res_run_ws = engine.evaluate_run(run_ws.run_id, strict_attribution=True)
+    assert res_run_ws.predicted_category == DiagnosticCategory.INCONCLUSIVE
+    assert "lacks an execution token" in res_run_ws.reason
+
+    # Case 2: Run with valid token, but alert with whitespace-only token
+    valid_token = "TOK-GENUINE-99"
+    run_valid = TestRunV1(
+        run_id="RUN-VALID-TOK-02",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token=valid_token,
+    )
+    store.add_run(run_valid)
+
+    norm_ev = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-TOK-02",
+        raw_event_id="RAW-T2",
+        source_event_id="SRC-T2",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run_valid.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=valid_token,
+    )
+    store.add_normalized_event(norm_ev)
+
+    # Spurious alert carrying whitespace-only token
+    alt_ws = AlertV1(
+        alert_id="ALT-WS-TOKEN",
+        source_alert_id="SRC-WS",
+        source_type="sigma",
+        alert_timestamp=t0 + timedelta(minutes=3),
+        host_id=run_valid.target_host,
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token="   ",
+    )
+    store.add_alert(alt_ws)
+
+    # In strict mode, whitespace alert must be treated as missing token -> INCONCLUSIVE (never false PASS)
+    res_alert_ws = engine.evaluate_run(run_valid.run_id, strict_attribution=True)
+    assert res_alert_ws.predicted_category == DiagnosticCategory.INCONCLUSIVE
+    assert res_alert_ws.predicted_category != DiagnosticCategory.PASS
+
+
+def test_strict_attribution_reused_execution_token_across_runs_rejected(base_setup):
+    """Regression: Reused execution token across distinct runs must not cause false PASS."""
+    store, scn, rule, t0 = base_setup
+    reused_token = "TOK-REUSE-999"
+
+    # Run 1: Genuine test run that generated telemetry and triggered detection
+    run_1 = TestRunV1(
+        run_id="RUN-REUSE-01",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0,
+        execution_token=reused_token,
+    )
+    store.add_run(run_1)
+
+    ev_1 = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-EV-01",
+        raw_event_id="RAW-E1",
+        source_event_id="SRC-E1",
+        source_timestamp=t0 + timedelta(minutes=2),
+        normalized_timestamp=t0 + timedelta(minutes=2),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run_1.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=reused_token,
+    )
+    store.add_normalized_event(ev_1)
+
+    alt_1 = AlertV1(
+        alert_id="ALT-GENUINE-01",
+        source_alert_id="SRC-A1",
+        source_type="sigma",
+        alert_timestamp=t0 + timedelta(minutes=3),
+        host_id=run_1.target_host,
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token=reused_token,
+    )
+    store.add_alert(alt_1)
+
+    # Run 2: Distinct run on same host with same token in overlapping window.
+    # Generates telemetry, but detection rule silently fails (no alert produced for Run 2).
+    run_2 = TestRunV1(
+        run_id="RUN-REUSE-02",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0 + timedelta(minutes=5),
+        execution_token=reused_token,
+    )
+    store.add_run(run_2)
+
+    ev_2 = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-EV-02",
+        raw_event_id="RAW-E2",
+        source_event_id="SRC-E2",
+        source_timestamp=t0 + timedelta(minutes=6),
+        normalized_timestamp=t0 + timedelta(minutes=6),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run_2.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=reused_token,
+    )
+    store.add_normalized_event(ev_2)
+
+    engine = AssuranceEngine(store)
+
+    # Run 2 must NEVER be awarded a false PASS by attributing Run 1's alert.
+    # Token reuse across overlapping runs compromises causal provenance -> INCONCLUSIVE.
+    res_run_2 = engine.evaluate_run(run_2.run_id, strict_attribution=True)
+    assert res_run_2.predicted_category == DiagnosticCategory.INCONCLUSIVE
+    assert res_run_2.predicted_category != DiagnosticCategory.PASS
+    assert "reused" in res_run_2.reason.lower()
+    assert res_run_2.metadata["attribution"]["status"] == AttributionStatus.CONFLICT.value
+
+
+def test_strict_attribution_pre_execution_alert_never_produces_pass(base_setup):
+    """Temporal causality: An alert generated prior to run.executed_at must never produce PASS."""
+    store, scn, rule, t0 = base_setup
+    tok = "TOK-TEMPORAL-01"
+
+    # Run commenced at t0 + 5m, but correlation window starts at t0
+    run = TestRunV1(
+        run_id="RUN-TEMP-01",
+        scenario_id=scn.scenario_id,
+        execution_mode=ExecutionMode.SYNTHETIC_SIMULATION,
+        target_host="WS-TARGET-01",
+        target_user="secops",
+        window_start=t0,
+        window_end=t0 + timedelta(minutes=15),
+        executed_at=t0 + timedelta(minutes=5),
+        execution_token=tok,
+    )
+    store.add_run(run)
+
+    # Legitimate event generated during execution at t0 + 6m
+    ev = NormalizedTelemetryEventV1(
+        normalized_event_id="NORM-TEMP-01",
+        raw_event_id="RAW-T1",
+        source_event_id="SRC-T1",
+        source_timestamp=t0 + timedelta(minutes=6),
+        normalized_timestamp=t0 + timedelta(minutes=6),
+        event_category=EventCategory.PROCESS_CREATION,
+        host=run.target_host,
+        process_name="powershell.exe",
+        command_line="powershell.exe -enc DownloadString",
+        execution_token=tok,
+    )
+    store.add_normalized_event(ev)
+
+    # Pre-execution alert generated at t0 + 2m (before executed_at = t0 + 5m)
+    pre_alert = AlertV1(
+        alert_id="ALT-PRE-EXEC-01",
+        source_alert_id="SRC-PRE-1",
+        source_type="sigma",
+        alert_timestamp=t0 + timedelta(minutes=2),
+        host_id=run.target_host,
+        rule_reference=scn.expected_detection_rule_id,
+        execution_token=tok,
+    )
+    store.add_alert(pre_alert)
+
+    engine = AssuranceEngine(store)
+    res = engine.evaluate_run(run.run_id, strict_attribution=True)
+
+    # Must reject pre-execution alert and diagnose DETECTION_NOT_TRIGGERED, never PASS
+    assert res.predicted_category == DiagnosticCategory.DETECTION_NOT_TRIGGERED
+    assert res.predicted_category != DiagnosticCategory.PASS
+    assert pre_alert.alert_id not in res.supporting_evidence_ids
+    assert any("occurring before test execution" in r for r in res.diagnostic_reasons)

@@ -330,7 +330,7 @@ class AssuranceEngine:
         """Core deterministic evaluation logic."""
 
         # Resolve execution token for run
-        run_token = run.execution_token
+        run_token = run.execution_token.strip() if run.execution_token else None
         if not run_token and run.metadata and "execution_token" in run.metadata:
             val = str(run.metadata["execution_token"]).strip()
             if val:
@@ -417,6 +417,72 @@ class AssuranceEngine:
                         )
                     },
                 )
+
+            # Guard against execution-token reuse across distinct runs with overlapping windows
+            other_runs = [
+                r for r in self.store.list_runs()
+                if r.run_id != run.run_id
+                and hosts_match(run.target_host, r.target_host)
+                and (
+                    (r.execution_token.strip() if r.execution_token else None) == run_token
+                    or (
+                        r.metadata
+                        and "execution_token" in r.metadata
+                        and str(r.metadata["execution_token"]).strip() == run_token
+                    )
+                )
+            ]
+            if other_runs:
+                grace_seconds = self.default_alert_grace_period_seconds
+                if run.metadata and "alert_grace_period_seconds" in run.metadata:
+                    try:
+                        grace_seconds = int(run.metadata["alert_grace_period_seconds"])
+                    except (ValueError, TypeError):
+                        grace_seconds = self.default_alert_grace_period_seconds
+                grace = timedelta(seconds=grace_seconds)
+                run_w_start = run.window_start - grace
+                run_w_end = run.window_end + grace
+
+                overlapping_reused_runs = []
+                for other in other_runs:
+                    other_w_start = other.window_start - grace
+                    other_w_end = other.window_end + grace
+                    o_start = other_w_start
+                    o_end = other_w_end
+                    r_start = run_w_start
+                    r_end = run_w_end
+                    if o_start.tzinfo is not None and r_start.tzinfo is None:
+                        r_start = r_start.replace(tzinfo=o_start.tzinfo)
+                        r_end = r_end.replace(tzinfo=o_start.tzinfo)
+                    elif o_start.tzinfo is None and r_start.tzinfo is not None:
+                        o_start = o_start.replace(tzinfo=r_start.tzinfo)
+                        o_end = o_end.replace(tzinfo=r_start.tzinfo)
+                    if max(r_start, o_start) <= min(r_end, o_end):
+                        overlapping_reused_runs.append(other)
+
+                if overlapping_reused_runs:
+                    other_ids = [r.run_id for r in overlapping_reused_runs]
+                    return self._make_result(
+                        run=run,
+                        scenario=scenario,
+                        category=DiagnosticCategory.INCONCLUSIVE,
+                        reason=(
+                            f"Strict attribution requested but execution token '{run_token}' is reused "
+                            f"across multiple runs ({', '.join(other_ids)}) on host '{run.target_host}' "
+                            f"with overlapping observation windows; causal provenance cannot be verified"
+                        ),
+                        confidence="uncertain",
+                        metadata={
+                            "attribution": self._build_attribution_metadata(
+                                run_token=run_token,
+                                status=AttributionStatus.CONFLICT.value,
+                                is_strict=True,
+                                notes=[
+                                    f"Execution token '{run_token}' reused by overlapping run(s): {', '.join(other_ids)}"
+                                ],
+                            )
+                        },
+                    )
 
         # ── Step 2: Correlate events to the run ──────────────────────────
         events = self.store.get_events_for_run(run)
@@ -548,7 +614,10 @@ class AssuranceEngine:
                     },
                 )
 
-            attributed_events = [e for e in matching_events if e.execution_token == run_token]
+            attributed_events = [
+                e for e in matching_events
+                if (e.execution_token.strip() if e.execution_token else None) == run_token
+            ]
             if attributed_events:
                 # Matching token found: attribute strictly to the run.
                 # Do not reject matching telemetry solely because unrelated untokenized events coexist.
@@ -556,7 +625,10 @@ class AssuranceEngine:
             else:
                 # No matching token found among candidate matching events.
                 # If untokenized candidate events exist, missing evidence prevents definitive classification.
-                untokenized_events = [e for e in matching_events if e.execution_token is None]
+                untokenized_events = [
+                    e for e in matching_events
+                    if not (e.execution_token and e.execution_token.strip())
+                ]
                 if untokenized_events:
                     return self._make_result(
                         run=run,
@@ -901,17 +973,21 @@ class AssuranceEngine:
 
         # 2. Separate matching vs mismatched alerts
         matching_token_alerts = [
-            a for a in all_rule_alerts if a.execution_token == run_token
+            a for a in all_rule_alerts
+            if (a.execution_token.strip() if a.execution_token else None) == run_token
         ]
         mismatched_alerts = [
             a for a in host_candidate_alerts
-            if a.execution_token is not None and a.execution_token != run_token
+            if (a.execution_token and a.execution_token.strip())
+            and (a.execution_token.strip() if a.execution_token else None) != run_token
         ]
 
-        # Correlate matching alerts strictly within the execution window on target host
+        # Correlate matching alerts strictly within the execution window on target host, occurring on or after run execution
         correlated_alerts = [
             a for a in matching_token_alerts
-            if hosts_match(run.target_host, a.host_id) and _is_in_window(a.alert_timestamp, run.window_start, run.window_end)
+            if hosts_match(run.target_host, a.host_id)
+            and _is_in_window(a.alert_timestamp, run.window_start, run.window_end)
+            and not _is_before_window(a.alert_timestamp, run.executed_at)
         ]
 
         # 3. Check for valid matching-token alert inside execution window FIRST.
@@ -1030,7 +1106,8 @@ class AssuranceEngine:
         # Missing evidence prevents causal linking -> INCONCLUSIVE
         missing_token_window_alerts = [
             a for a in host_candidate_alerts
-            if a.execution_token is None and _is_in_window(a.alert_timestamp, run.window_start, run.window_end)
+            if not (a.execution_token and a.execution_token.strip())
+            and _is_in_window(a.alert_timestamp, run.window_start, run.window_end)
         ]
         if missing_token_window_alerts:
             attr_meta = self._build_attribution_metadata(
@@ -1089,6 +1166,14 @@ class AssuranceEngine:
             diagnostic_reasons.append(
                 f"Rejected {len(mismatched_alerts)} mismatched alert(s) on host (concurrent tasks/admin activity); "
                 f"mismatched alerts do not prove detection failure, but expected rule was silent for tested attack"
+            )
+        pre_exec_alerts = [
+            a for a in matching_token_alerts
+            if hosts_match(run.target_host, a.host_id) and _is_before_window(a.alert_timestamp, run.executed_at)
+        ]
+        if pre_exec_alerts:
+            diagnostic_reasons.append(
+                f"Rejected {len(pre_exec_alerts)} alert(s) carrying token '{run_token}' occurring before test execution ({run.executed_at.isoformat()})"
             )
 
         return self._make_result(
