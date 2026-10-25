@@ -144,12 +144,13 @@ def ingest_alerts(
     store = get_store()
     alert_list = [alerts] if isinstance(alerts, AlertV1) else alerts
     ingested = []
-    for a in alert_list:
-        try:
-            store.add_alert(a)
-            ingested.append(a)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
+    try:
+        with store.transaction():
+            for a in alert_list:
+                store.add_alert(a)
+                ingested.append(a)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     return ingested
 
 

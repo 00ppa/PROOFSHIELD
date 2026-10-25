@@ -99,39 +99,82 @@ import re
 _AUTH_VALUE_PATTERN = re.compile(r"^(?:Bearer|ApiKey|Basic)\s+[A-Za-z0-9_\-\.\+/=]+", re.IGNORECASE)
 
 
-def _sanitize_metadata(val: Any) -> Any:
+import math
+
+
+def _sanitize_metadata(
+    val: Any,
+    max_depth: int = 32,
+    _current_depth: int = 0,
+    _seen_ids: Optional[set] = None,
+) -> Any:
     """Recursively scrub credentials from metadata dicts while preserving forensic fields.
 
     Preserves legitimate investigation attributes like 'password_reset', 'secret_scope',
     'auth_token_id', and 'password_hash' unless they hold cleartext credentials.
+    Protects against infinite recursion from cyclic structures and deeply nested payloads.
     """
-    if isinstance(val, dict):
-        sanitized = {}
-        for k, v in val.items():
-            k_clean = str(k).strip().lower().replace("-", "_").replace(".", "_")
+    if _current_depth >= max_depth:
+        return "[REDACTED_NESTED]"
 
-            # Check if this is an explicitly preserved forensic attribute
-            is_forensic_attribute = any(
-                k_clean.endswith(suf) for suf in _FORENSIC_NON_SECRET_SUFFIXES
-            )
+    if _seen_ids is None:
+        _seen_ids = set()
 
-            if is_forensic_attribute:
-                sanitized[k] = _sanitize_metadata(v)
-            elif k_clean in _SENSITIVE_HEADER_KEYS:
-                sanitized[k] = "[REDACTED]"
-            elif k_clean in _EXACT_SECRET_KEYS or any(k_clean.endswith(suf) for suf in _EXACT_SECRET_SUFFIXES):
-                if isinstance(v, (bool, int, float)) or v is None:
-                    sanitized[k] = v
-                else:
+    if isinstance(val, (dict, list)):
+        val_id = id(val)
+        if val_id in _seen_ids:
+            return "[REDACTED_CYCLE]"
+        _seen_ids.add(val_id)
+
+    try:
+        if isinstance(val, dict):
+            sanitized = {}
+            for k, v in val.items():
+                k_clean = str(k).strip().lower().replace("-", "_").replace(".", "_")
+
+                # Check if this is an explicitly preserved forensic attribute
+                is_forensic_attribute = any(
+                    k_clean.endswith(suf) for suf in _FORENSIC_NON_SECRET_SUFFIXES
+                )
+
+                if is_forensic_attribute:
+                    sanitized[k] = _sanitize_metadata(
+                        v,
+                        max_depth=max_depth,
+                        _current_depth=_current_depth + 1,
+                        _seen_ids=_seen_ids,
+                    )
+                elif k_clean in _SENSITIVE_HEADER_KEYS:
                     sanitized[k] = "[REDACTED]"
-            elif isinstance(v, str) and _AUTH_VALUE_PATTERN.match(v.strip()):
-                sanitized[k] = "[REDACTED]"
-            else:
-                sanitized[k] = _sanitize_metadata(v)
-        return sanitized
-    if isinstance(val, list):
-        return [_sanitize_metadata(item) for item in val]
-    return val
+                elif k_clean in _EXACT_SECRET_KEYS or any(k_clean.endswith(suf) for suf in _EXACT_SECRET_SUFFIXES):
+                    if isinstance(v, (bool, int, float)) or v is None:
+                        sanitized[k] = v
+                    else:
+                        sanitized[k] = "[REDACTED]"
+                elif isinstance(v, str) and _AUTH_VALUE_PATTERN.match(v.strip()):
+                    sanitized[k] = "[REDACTED]"
+                else:
+                    sanitized[k] = _sanitize_metadata(
+                        v,
+                        max_depth=max_depth,
+                        _current_depth=_current_depth + 1,
+                        _seen_ids=_seen_ids,
+                    )
+            return sanitized
+        if isinstance(val, list):
+            return [
+                _sanitize_metadata(
+                    item,
+                    max_depth=max_depth,
+                    _current_depth=_current_depth + 1,
+                    _seen_ids=_seen_ids,
+                )
+                for item in val
+            ]
+        return val
+    finally:
+        if isinstance(val, (dict, list)):
+            _seen_ids.remove(id(val))
 
 
 def _get_nested(data: Dict[str, Any], path: str) -> Any:
@@ -184,10 +227,19 @@ def _parse_timestamp(raw_val: Any) -> Optional[datetime]:
         return raw_val.astimezone(timezone.utc)
 
     if isinstance(raw_val, (int, float)):
-        # If value is in milliseconds (greater than year 2286 in seconds, ~1e11)
-        if raw_val > 1e11:
-            return datetime.fromtimestamp(raw_val / 1000.0, tz=timezone.utc)
-        return datetime.fromtimestamp(raw_val, tz=timezone.utc)
+        if math.isnan(raw_val) or math.isinf(raw_val):
+            raise ElasticAlertMappingError(
+                f"Malformed numeric timestamp '{raw_val}': value cannot be NaN or Infinite"
+            )
+        try:
+            # If value is in milliseconds (greater than year 2286 in seconds, ~1e11)
+            if raw_val > 1e11:
+                return datetime.fromtimestamp(raw_val / 1000.0, tz=timezone.utc)
+            return datetime.fromtimestamp(raw_val, tz=timezone.utc)
+        except (OverflowError, ValueError, OSError) as exc:
+            raise ElasticAlertMappingError(
+                f"Malformed or out-of-range numeric timestamp '{raw_val}': {exc}"
+            ) from exc
 
     if isinstance(raw_val, str):
         cleaned = raw_val.strip()
