@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +28,13 @@ def create_application() -> FastAPI:
         description=(
             "Cybersecurity detection assurance and failure-diagnosis platform. "
             "Evaluates detection engineering efficacy, root-cause telemetry gaps, "
-            "and alert pipeline determinism without executing intrusive commands."
+            "and alert pipeline determinism without executing intrusive commands.\n\n"
+            "SECURITY NOTICE & TRUST BOUNDARY:\n"
+            "- Single-Tenant Architecture: All endpoints operate on a shared global entity store without tenant isolation.\n"
+            "- Authentication Boundary: ProofShield does not implement an internal authentication or authorization model; "
+            "all endpoints are designed for trusted local execution or deployment behind a secure, authenticated reverse proxy.\n"
+            "- Ingestion Limits: Bulk ingestion endpoints enforce payload size and batch record boundaries "
+            "to prevent denial-of-service and memory exhaustion."
         ),
         version=__version__,
         docs_url="/docs",
@@ -35,11 +42,26 @@ def create_application() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Permissive local CORS for development
+    cors_env = os.environ.get("PROOFSHIELD_CORS_ORIGINS")
+    if cors_env:
+        origins = [o.strip() for o in cors_env.split(",") if o.strip()]
+    else:
+        origins = [
+            "http://localhost",
+            "http://localhost:8000",
+            "http://localhost:3000",
+            "http://127.0.0.1",
+            "http://127.0.0.1:8000",
+            "http://127.0.0.1:3000",
+        ]
+
+    # When wildcards are allowed, credentials cannot be enabled per CORS specification
+    allow_credentials = False if "*" in origins else True
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=origins,
+        allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )

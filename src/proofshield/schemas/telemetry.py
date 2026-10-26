@@ -2,10 +2,11 @@
 
 from datetime import datetime
 from typing import Any, Dict, Literal, Optional
-from pydantic import Field
+from pydantic import Field, field_validator
 from proofshield.schemas.common import (
     EventCategory,
     ProofshieldBaseModel,
+    validate_nesting_depth,
 )
 
 
@@ -44,6 +45,13 @@ class RawTelemetryEventV1(ProofshieldBaseModel):
         ...,
         description="Unaltered raw payload dictionary from the source logger",
     )
+
+    @field_validator("raw_payload")
+    @classmethod
+    def validate_raw_payload_depth(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        if v:
+            validate_nesting_depth(v, max_depth=32)
+        return v
 
 
 class NormalizedTelemetryEventV1(ProofshieldBaseModel):

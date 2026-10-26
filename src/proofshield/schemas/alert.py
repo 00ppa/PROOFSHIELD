@@ -2,8 +2,8 @@
 
 from datetime import datetime
 from typing import Any, Dict, Literal, Optional
-from pydantic import Field
-from proofshield.schemas.common import ProofshieldBaseModel
+from pydantic import Field, field_validator
+from proofshield.schemas.common import ProofshieldBaseModel, validate_nesting_depth
 
 
 class AlertV1(ProofshieldBaseModel):
@@ -66,3 +66,10 @@ class AlertV1(ProofshieldBaseModel):
         default_factory=dict,
         description="Additional alert metadata and context",
     )
+
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata_depth(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        if v:
+            validate_nesting_depth(v, max_depth=32)
+        return v

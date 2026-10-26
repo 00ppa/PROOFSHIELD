@@ -1,6 +1,7 @@
 """Common types, enums, and base configuration for PROOFSHIELD schemas."""
 
 from enum import Enum
+from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 SCHEMA_VERSION: str = "v1"
@@ -104,3 +105,20 @@ class ProofshieldBaseModel(BaseModel):
         str_strip_whitespace=True,
         populate_by_name=True,
     )
+
+
+def validate_nesting_depth(val: Any, max_depth: int = 32, current_depth: int = 0) -> None:
+    """Validate that nested dictionary/list depth does not exceed max_depth.
+
+    Protects against stack overflow, recursion exhaustion, and memory bombs.
+    """
+    if current_depth > max_depth:
+        raise ValueError(f"Payload nesting depth exceeds maximum allowed limit of {max_depth}.")
+    if isinstance(val, dict):
+        for v in val.values():
+            if isinstance(v, (dict, list)):
+                validate_nesting_depth(v, max_depth=max_depth, current_depth=current_depth + 1)
+    elif isinstance(val, list):
+        for v in val:
+            if isinstance(v, (dict, list)):
+                validate_nesting_depth(v, max_depth=max_depth, current_depth=current_depth + 1)

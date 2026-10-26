@@ -1,8 +1,10 @@
 """Telemetry ingestion and normalisation endpoints."""
 
+import re
+import sqlite3
 from typing import Any, Dict, List, Literal, Optional, Union
 from fastapi import APIRouter, Body, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from proofshield.normalisation.engine import NormalisationEngine
 from proofshield.schemas import (
@@ -23,6 +25,10 @@ from proofshield.storage.jsonl_loader import (
     validate_jsonl_stream,
 )
 
+MAX_JSONL_CONTENT_BYTES: int = 10 * 1024 * 1024  # 10 MB limit on raw string content
+MAX_JSONL_LINES: int = 10_000  # Maximum JSONL lines per request
+MAX_BATCH_RECORDS: int = 5_000  # Maximum batch records per request
+
 router = APIRouter(prefix="/api/v1", tags=["Telemetry & Normalisation"])
 normalisation_engine = NormalisationEngine()
 
@@ -41,7 +47,11 @@ class IngestJSONLRequest(BaseModel):
         ...,
         description="Target Pydantic schema model to validate against",
     )
-    content: str = Field(..., description="Raw newline-delimited JSON (JSONL) text")
+    content: str = Field(
+        ...,
+        max_length=MAX_JSONL_CONTENT_BYTES,
+        description="Raw newline-delimited JSON (JSONL) text (max 10MB)",
+    )
     store: Optional[bool] = Field(
         default=False,
         description="Persist valid records to store if True (default: False)",
@@ -50,6 +60,17 @@ class IngestJSONLRequest(BaseModel):
         default=False,
         description="If True with store=True, transaction rolls back on any error (default: False)",
     )
+
+    @field_validator("content")
+    @classmethod
+    def validate_content_byte_length(cls, v: str) -> str:
+        """Genuinely enforce the 10 MB payload boundary in bytes, not merely character count."""
+        byte_len = len(v.encode("utf-8"))
+        if byte_len > MAX_JSONL_CONTENT_BYTES:
+            raise ValueError(
+                f"JSONL content byte size ({byte_len} bytes) exceeds maximum limit of {MAX_JSONL_CONTENT_BYTES} bytes (10MB)."
+            )
+        return v
 
 
 class IngestJSONLResponse(BaseModel):
@@ -168,13 +189,18 @@ def ingest_raw_telemetry(
     Raises HTTP 409 if any event has a duplicate identifier.
     """
     event_list = [events] if isinstance(events, RawTelemetryEventV1) else events
+    if len(event_list) > MAX_BATCH_RECORDS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Batch size exceeds maximum limit of {MAX_BATCH_RECORDS} events (received {len(event_list)}).",
+        )
     if store:
         s = get_store()
         try:
             with s.transaction():
                 for evt in event_list:
                     s.add_raw_event(evt)
-        except ValueError as exc:
+        except (ValueError, sqlite3.Error) as exc:
             raise HTTPException(status_code=409, detail=str(exc))
     return event_list
 
@@ -201,6 +227,11 @@ def normalize_telemetry(
     Raises HTTP 409 if any normalized event has a duplicate identifier.
     """
     event_list = [events] if isinstance(events, RawTelemetryEventV1) else events
+    if len(event_list) > MAX_BATCH_RECORDS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Batch size exceeds maximum limit of {MAX_BATCH_RECORDS} events (received {len(event_list)}).",
+        )
     try:
         normalized = normalisation_engine.normalize_batch(event_list)
     except Exception as exc:
@@ -212,7 +243,7 @@ def normalize_telemetry(
             with s.transaction():
                 for norm_evt in normalized:
                     s.add_normalized_event(norm_evt)
-        except ValueError as exc:
+        except (ValueError, sqlite3.Error) as exc:
             raise HTTPException(status_code=409, detail=str(exc))
 
     return normalized
@@ -248,6 +279,11 @@ def ingest_jsonl_payload(
 
     schema_cls = schema_map[payload.schema_type]
     lines = payload.content.splitlines()
+    if len(lines) > MAX_JSONL_LINES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"JSONL stream exceeds maximum batch limit of {MAX_JSONL_LINES} lines (received {len(lines)}).",
+        )
     report = validate_jsonl_stream(lines, schema_cls)
 
     persisted_count = 0
@@ -269,15 +305,20 @@ def ingest_jsonl_payload(
                             _persist_single_record(s, payload.schema_type, rec)
                     persisted_count = len(report.records)
                     stored = True
-                except ValueError as exc:
+                except (ValueError, sqlite3.Error, OSError) as exc:
                     stored = False
                     persisted_count = 0
+                    sanitized_msg = re.sub(
+                        r"([A-Za-z]:\\[^:\s]+|/(?:home|var|tmp|etc|usr|root)/[^\s:]+)",
+                        "[REDACTED_PATH]",
+                        str(exc),
+                    )
                     report.errors.append(
                         JSONLLineError(
                             line_number=0,
                             raw_content="atomic_batch_transaction",
                             error_type="StorageError",
-                            error_message=f"Atomic batch insertion aborted: {str(exc)}",
+                            error_message=f"Atomic batch insertion aborted: {sanitized_msg}",
                         )
                     )
                     report.error_count += 1
@@ -288,14 +329,19 @@ def ingest_jsonl_payload(
                 try:
                     _persist_single_record(s, payload.schema_type, rec)
                     successful_persists += 1
-                except ValueError as exc:
+                except (ValueError, sqlite3.Error, OSError) as exc:
                     rec_id = _get_record_id(rec)
+                    sanitized_msg = re.sub(
+                        r"([A-Za-z]:\\[^:\s]+|/(?:home|var|tmp|etc|usr|root)/[^\s:]+)",
+                        "[REDACTED_PATH]",
+                        str(exc),
+                    )
                     report.errors.append(
                         JSONLLineError(
                             line_number=line_no,
                             raw_content=f"{rec.__class__.__name__}(id={rec_id})",
                             error_type="StorageError",
-                            error_message=str(exc),
+                            error_message=sanitized_msg,
                         )
                     )
                     report.error_count += 1

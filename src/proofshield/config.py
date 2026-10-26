@@ -45,6 +45,9 @@ def validate_sqlite_path(path_val: Union[str, Path]) -> str:
     if not s:
         raise ValueError("SQLite database path cannot be empty or whitespace.")
 
+    if "\0" in s:
+        raise ValueError("SQLite database path cannot contain null bytes.")
+
     if s == ":memory:":
         return s
 

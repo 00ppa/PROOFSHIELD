@@ -73,7 +73,7 @@ def extract_execution_token(
 
     # Check structured payload keys
     for k, v in p.items():
-        if k.strip().lower() in TOKEN_STRUCTURED_KEYS and v is not None:
+        if isinstance(k, str) and k.strip().lower() in TOKEN_STRUCTURED_KEYS and v is not None:
             val = str(v).strip()
             if not val or val.lower() in _TOKEN_IGNORE_VALUES:
                 continue

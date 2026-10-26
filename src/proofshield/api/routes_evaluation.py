@@ -1,5 +1,4 @@
-"""Diagnostic evaluation, entity management, and assurance engine endpoints."""
-
+import sqlite3
 from typing import List, Optional, Union
 from fastapi import APIRouter, Body, HTTPException, Query
 
@@ -13,6 +12,8 @@ from proofshield.schemas import (
 )
 from proofshield.services.evaluation import AssuranceEngine
 from proofshield.services.store import get_store
+
+MAX_ALERT_BATCH_SIZE: int = 5_000
 
 router = APIRouter(prefix="/api/v1", tags=["Diagnostic Evaluation & Management"])
 
@@ -29,7 +30,7 @@ def create_scenario(scenario: ScenarioV1) -> ScenarioV1:
     store = get_store()
     try:
         return store.add_scenario(scenario)
-    except ValueError as exc:
+    except (ValueError, sqlite3.Error) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
 
@@ -38,8 +39,14 @@ def create_scenario(scenario: ScenarioV1) -> ScenarioV1:
     response_model=List[ScenarioV1],
     summary="List registered test scenarios",
 )
-def list_scenarios() -> List[ScenarioV1]:
-    return get_store().list_scenarios()
+def list_scenarios(
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Maximum number of records to return"),
+    offset: Optional[int] = Query(None, ge=0, description="Number of records to skip for pagination"),
+) -> List[ScenarioV1]:
+    items = get_store().list_scenarios()
+    start = offset or 0
+    end = start + limit if limit is not None else None
+    return items[start:end]
 
 
 @router.get(
@@ -66,7 +73,7 @@ def create_test_run(run: TestRunV1) -> TestRunV1:
     store = get_store()
     try:
         return store.add_run(run)
-    except ValueError as exc:
+    except (ValueError, sqlite3.Error) as exc:
         if "Scenario not found" in str(exc):
             raise HTTPException(status_code=404, detail=str(exc))
         raise HTTPException(status_code=409, detail=str(exc))
@@ -78,9 +85,14 @@ def create_test_run(run: TestRunV1) -> TestRunV1:
     summary="List test runs",
 )
 def list_test_runs(
-    scenario_id: Optional[str] = Query(None, description="Filter by scenario ID")
+    scenario_id: Optional[str] = Query(None, description="Filter by scenario ID"),
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Maximum number of records to return"),
+    offset: Optional[int] = Query(None, ge=0, description="Number of records to skip for pagination"),
 ) -> List[TestRunV1]:
-    return get_store().list_runs(scenario_id=scenario_id)
+    runs = get_store().list_runs(scenario_id=scenario_id)
+    start = offset or 0
+    end = start + limit if limit is not None else None
+    return runs[start:end]
 
 
 @router.get(
@@ -106,7 +118,7 @@ def create_rule(rule: DetectionRuleV1) -> DetectionRuleV1:
     store = get_store()
     try:
         return store.add_rule(rule)
-    except ValueError as exc:
+    except (ValueError, sqlite3.Error) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
 
@@ -115,8 +127,14 @@ def create_rule(rule: DetectionRuleV1) -> DetectionRuleV1:
     response_model=List[DetectionRuleV1],
     summary="List detection rules",
 )
-def list_rules() -> List[DetectionRuleV1]:
-    return get_store().list_rules()
+def list_rules(
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Maximum number of records to return"),
+    offset: Optional[int] = Query(None, ge=0, description="Number of records to skip for pagination"),
+) -> List[DetectionRuleV1]:
+    rules = get_store().list_rules()
+    start = offset or 0
+    end = start + limit if limit is not None else None
+    return rules[start:end]
 
 
 @router.get(
@@ -141,15 +159,20 @@ def get_rule(rule_id: str) -> DetectionRuleV1:
 def ingest_alerts(
     alerts: Union[AlertV1, List[AlertV1]] = Body(...)
 ) -> List[AlertV1]:
-    store = get_store()
     alert_list = [alerts] if isinstance(alerts, AlertV1) else alerts
+    if len(alert_list) > MAX_ALERT_BATCH_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Batch size exceeds maximum limit of {MAX_ALERT_BATCH_SIZE} alerts (received {len(alert_list)}).",
+        )
+    store = get_store()
     ingested = []
     try:
         with store.transaction():
             for a in alert_list:
                 store.add_alert(a)
                 ingested.append(a)
-    except ValueError as exc:
+    except (ValueError, sqlite3.Error) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     return ingested
 
@@ -159,8 +182,14 @@ def ingest_alerts(
     response_model=List[AlertV1],
     summary="List ingested alerts",
 )
-def list_alerts() -> List[AlertV1]:
-    return get_store().list_alerts()
+def list_alerts(
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Maximum number of records to return"),
+    offset: Optional[int] = Query(None, ge=0, description="Number of records to skip for pagination"),
+) -> List[AlertV1]:
+    alerts = get_store().list_alerts()
+    start = offset or 0
+    end = start + limit if limit is not None else None
+    return alerts[start:end]
 
 
 # ── Ground Truth ──────────────────────────────────────────────────────────
@@ -174,7 +203,7 @@ def create_ground_truth(gt: GroundTruthV1) -> GroundTruthV1:
     store = get_store()
     try:
         return store.add_ground_truth(gt)
-    except ValueError as exc:
+    except (ValueError, sqlite3.Error) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
 
@@ -183,8 +212,14 @@ def create_ground_truth(gt: GroundTruthV1) -> GroundTruthV1:
     response_model=List[GroundTruthV1],
     summary="List all ground truth records",
 )
-def list_ground_truths() -> List[GroundTruthV1]:
-    return get_store().list_ground_truths()
+def list_ground_truths(
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Maximum number of records to return"),
+    offset: Optional[int] = Query(None, ge=0, description="Number of records to skip for pagination"),
+) -> List[GroundTruthV1]:
+    truths = get_store().list_ground_truths()
+    start = offset or 0
+    end = start + limit if limit is not None else None
+    return truths[start:end]
 
 
 @router.get(
@@ -248,5 +283,11 @@ def get_evaluation_for_run(run_id: str) -> DiagnosticResultV1:
     response_model=List[DiagnosticResultV1],
     summary="List all diagnostic evaluation results",
 )
-def list_evaluations() -> List[DiagnosticResultV1]:
-    return get_store().list_results()
+def list_evaluations(
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Maximum number of records to return"),
+    offset: Optional[int] = Query(None, ge=0, description="Number of records to skip for pagination"),
+) -> List[DiagnosticResultV1]:
+    results = get_store().list_results()
+    start = offset or 0
+    end = start + limit if limit is not None else None
+    return results[start:end]

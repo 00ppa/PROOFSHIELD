@@ -316,12 +316,13 @@ class AssuranceEngine:
         """Check if at least one candidate alert has a valid timestamp and correlates."""
         for a in alerts:
             if a.alert_timestamp is not None and hosts_match(run.target_host, a.host_id):
-                if not is_strict:
-                    if _is_in_window(a.alert_timestamp, run.window_start, run.window_end):
-                        return True
-                else:
-                    if run_token and a.execution_token == run_token and _is_in_window(a.alert_timestamp, run.window_start, run.window_end):
-                        return True
+                if not _is_before_window(a.alert_timestamp, run.executed_at):
+                    if not is_strict:
+                        if _is_in_window(a.alert_timestamp, run.window_start, run.window_end):
+                            return True
+                    else:
+                        if run_token and a.execution_token == run_token and _is_in_window(a.alert_timestamp, run.window_start, run.window_end):
+                            return True
         return False
 
     def _evaluate(
@@ -422,7 +423,6 @@ class AssuranceEngine:
             other_runs = [
                 r for r in self.store.list_runs()
                 if r.run_id != run.run_id
-                and hosts_match(run.target_host, r.target_host)
                 and (
                     (r.execution_token.strip() if r.execution_token else None) == run_token
                     or (
@@ -468,7 +468,7 @@ class AssuranceEngine:
                         category=DiagnosticCategory.INCONCLUSIVE,
                         reason=(
                             f"Strict attribution requested but execution token '{run_token}' is reused "
-                            f"across multiple runs ({', '.join(other_ids)}) on host '{run.target_host}' "
+                            f"across multiple runs ({', '.join(other_ids)}) "
                             f"with overlapping observation windows; causal provenance cannot be verified"
                         ),
                         confidence="uncertain",
@@ -1280,6 +1280,8 @@ class AssuranceEngine:
             if hosts_match(run.target_host, alert.host_id):
                 ts = alert.alert_timestamp
                 if ts is None:
+                    continue
+                if _is_before_window(ts, run.executed_at):
                     continue
                 w_start = run.window_start
                 w_end = run.window_end
