@@ -20,6 +20,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 from proofshield.config import validate_sqlite_path
 from proofshield.normalisation.engine import extract_execution_token
 from proofshield.schemas.alert import AlertV1
+from proofshield.schemas.campaign import CampaignDefinitionV1, CampaignRunV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
 from proofshield.schemas.ground_truth import GroundTruthV1
@@ -392,7 +393,40 @@ class SQLiteStore:
                 "CREATE INDEX IF NOT EXISTS idx_ground_truths_run ON ground_truths(run_id);"
             )
 
-            # 9. Verify physical schema integrity across all core tables
+            # 9. Campaigns
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS campaigns (
+                    campaign_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                """
+            )
+
+            # 10. Campaign Runs
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS campaign_runs (
+                    run_id TEXT PRIMARY KEY,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE RESTRICT,
+                    status TEXT NOT NULL,
+                    is_replay INTEGER NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    payload_json TEXT NOT NULL
+                );
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_campaign_runs_campaign ON campaign_runs(campaign_id);"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_campaign_runs_started ON campaign_runs(started_at);"
+            )
+
+            # 11. Verify physical schema integrity across all core tables
             required_columns = {
                 "scenarios": {"scenario_id", "name", "mitre_technique_id", "payload_json"},
                 "test_runs": {"run_id", "scenario_id", "execution_mode", "payload_json"},
@@ -402,6 +436,8 @@ class SQLiteStore:
                 "alerts": {"alert_id", "payload_json"},
                 "diagnostic_results": {"diagnostic_id", "payload_json"},
                 "ground_truths": {"ground_truth_id", "payload_json"},
+                "campaigns": {"campaign_id", "name", "created_at", "payload_json"},
+                "campaign_runs": {"run_id", "campaign_id", "status", "is_replay", "started_at", "payload_json"},
             }
             for tbl, expected_cols in required_columns.items():
                 cursor.execute(f"PRAGMA table_info({tbl});")
@@ -457,6 +493,8 @@ class SQLiteStore:
         self._check_open()
         with self.transaction() as cursor:
             # Delete child tables before parent tables to respect foreign keys
+            cursor.execute("DELETE FROM campaign_runs;")
+            cursor.execute("DELETE FROM campaigns;")
             cursor.execute("DELETE FROM ground_truths;")
             cursor.execute("DELETE FROM diagnostic_results;")
             cursor.execute("DELETE FROM alerts;")
@@ -1131,3 +1169,129 @@ class SQLiteStore:
                 return [GroundTruthV1.model_validate_json(row[0]) for row in cur.fetchall()]
             finally:
                 cur.close()
+
+    # ── Campaigns ─────────────────────────────────────────────────────────
+
+    def add_campaign(self, campaign: CampaignDefinitionV1) -> CampaignDefinitionV1:
+        """Register a campaign definition. Raises ValueError on duplicate ID."""
+        with self._lock:
+            self._check_open()
+            with self.transaction() as cursor:
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO campaigns (campaign_id, name, created_at, payload_json)
+                        VALUES (?, ?, ?, ?);
+                        """,
+                        (
+                            campaign.campaign_id,
+                            campaign.name,
+                            to_canonical_utc_iso(campaign.created_at),
+                            campaign.model_dump_json(),
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError(f"Campaign already exists: {campaign.campaign_id}") from exc
+            return campaign
+
+    def get_campaign(self, campaign_id: str) -> Optional[CampaignDefinitionV1]:
+        """Retrieve a campaign definition by its identifier."""
+        with self._lock:
+            self._check_open()
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    "SELECT payload_json FROM campaigns WHERE campaign_id = ?;",
+                    (campaign_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return CampaignDefinitionV1.model_validate_json(row[0])
+            finally:
+                cursor.close()
+
+    def list_campaigns(self) -> List[CampaignDefinitionV1]:
+        """List all registered campaign definitions, ordered deterministically by creation timestamp."""
+        with self._lock:
+            self._check_open()
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    "SELECT payload_json FROM campaigns ORDER BY created_at ASC;"
+                )
+                return [CampaignDefinitionV1.model_validate_json(r[0]) for r in cursor.fetchall()]
+            finally:
+                cursor.close()
+
+    # ── Campaign Runs ─────────────────────────────────────────────────────
+
+    def add_campaign_run(self, run: CampaignRunV1) -> CampaignRunV1:
+        """Record an executed campaign run. Raises ValueError on duplicate ID or missing campaign."""
+        with self._lock:
+            self._check_open()
+            with self.transaction() as cursor:
+                cursor.execute(
+                    "SELECT 1 FROM campaigns WHERE campaign_id = ?;",
+                    (run.campaign_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError(f"Campaign not found: {run.campaign_id}")
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO campaign_runs (
+                            run_id, campaign_id, status, is_replay, started_at, completed_at, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            run.run_id,
+                            run.campaign_id,
+                            run.status.value,
+                            1 if run.is_replay else 0,
+                            to_canonical_utc_iso(run.started_at),
+                            to_canonical_utc_iso(run.completed_at) if run.completed_at else None,
+                            run.model_dump_json(),
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError(f"Campaign run already exists: {run.run_id}") from exc
+            return run
+
+    def get_campaign_run(self, run_id: str) -> Optional[CampaignRunV1]:
+        """Retrieve an executed campaign run by its identifier."""
+        with self._lock:
+            self._check_open()
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    "SELECT payload_json FROM campaign_runs WHERE run_id = ?;",
+                    (run_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return CampaignRunV1.model_validate_json(row[0])
+            finally:
+                cursor.close()
+
+    def list_campaign_runs(
+        self, campaign_id: Optional[str] = None
+    ) -> List[CampaignRunV1]:
+        """List campaign runs, optionally filtered by campaign ID, ordered by start time."""
+        with self._lock:
+            self._check_open()
+            cursor = self.connection.cursor()
+            try:
+                if campaign_id is not None:
+                    cursor.execute(
+                        "SELECT payload_json FROM campaign_runs WHERE campaign_id = ? ORDER BY started_at ASC;",
+                        (campaign_id,),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT payload_json FROM campaign_runs ORDER BY started_at ASC;"
+                    )
+                return [CampaignRunV1.model_validate_json(r[0]) for r in cursor.fetchall()]
+            finally:
+                cursor.close()

@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from proofshield import __version__
+from proofshield.api.routes_campaigns import router as campaigns_router
 from proofshield.api.routes_evaluation import router as evaluation_router
 from proofshield.api.routes_health import router as health_router
 from proofshield.api.routes_telemetry import router as telemetry_router
@@ -70,6 +71,7 @@ def create_application() -> FastAPI:
     app.include_router(health_router)
     app.include_router(telemetry_router)
     app.include_router(evaluation_router)
+    app.include_router(campaigns_router)
 
     return app
 

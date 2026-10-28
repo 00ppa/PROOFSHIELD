@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional, Protocol, runtime_checkable
 
 from proofshield.schemas.alert import AlertV1
+from proofshield.schemas.campaign import CampaignDefinitionV1, CampaignRunV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
 from proofshield.schemas.ground_truth import GroundTruthV1
@@ -180,4 +181,34 @@ class StoreProtocol(Protocol):
 
     def list_ground_truths(self) -> List[GroundTruthV1]:
         """List all ground truth records."""
+        ...
+
+    # ── Campaigns ─────────────────────────────────────────────────────────
+
+    def add_campaign(self, campaign: CampaignDefinitionV1) -> CampaignDefinitionV1:
+        """Register a campaign definition. Raises ValueError on duplicate ID."""
+        ...
+
+    def get_campaign(self, campaign_id: str) -> Optional[CampaignDefinitionV1]:
+        """Retrieve a campaign definition by its identifier."""
+        ...
+
+    def list_campaigns(self) -> List[CampaignDefinitionV1]:
+        """List all registered campaign definitions."""
+        ...
+
+    # ── Campaign Runs ─────────────────────────────────────────────────────
+
+    def add_campaign_run(self, run: CampaignRunV1) -> CampaignRunV1:
+        """Record an executed campaign run. Raises ValueError on duplicate ID or missing campaign."""
+        ...
+
+    def get_campaign_run(self, run_id: str) -> Optional[CampaignRunV1]:
+        """Retrieve an executed campaign run by its identifier."""
+        ...
+
+    def list_campaign_runs(
+        self, campaign_id: Optional[str] = None
+    ) -> List[CampaignRunV1]:
+        """List campaign runs, optionally filtered by campaign ID."""
         ...

@@ -4,7 +4,7 @@
 
 - **Author & Maintainer**: FS ([@00ppa](https://github.com/00ppa))
 - **Status**: Research Prototype (v0.1.0)
-- **Test Suite**: 321/321 passing automated tests across 21 modules (4.5s runtime)
+- **Test Suite**: 451/451 passing automated tests across 29 modules (15s runtime)
 - **Benchmark**: 25 controlled benchmark scenarios (BM-01 to BM-25) + 12-case fault matrix (FT-01 to FT-12)
 - **Architecture Specification**: Detailed specifications in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
@@ -39,6 +39,9 @@
 
 7. **Opt-In API Telemetry Persistence Bridge**:
    Provides explicit, safe telemetry persistence across REST ingestion routes (`POST /api/v1/telemetry/raw`, `POST /api/v1/telemetry/normalize`, `POST /api/v1/ingest/jsonl`) via `store=true` (default: `store=false`). Supports fault-isolated streaming JSONL batch import with accurate line-level error reporting, atomic all-or-nothing transactions via `atomic=true`, and full parity across both in-memory and persistent SQLite storage backends.
+
+8. **Detection Validation Campaign Engine, Replay & Auditable Evidence (Phase 16)**:
+   Orchestrates multi-scenario validation campaigns with deterministic execution ordering, failure isolation policies (`CONTINUE_ON_ERROR` vs `STOP_ON_ERROR`), RFC 8785 canonical evidence manifest hashing (SHA-256), non-destructive replay against immutable captured evidence, regression comparisons (`CampaignComparisonV1`), and root-cause grouping across detection pipelines.
 
 ---
 
@@ -141,7 +144,8 @@ Case                   | Scenario            | Ground Truth           | Predicte
 ```text
 PROOFSHIELD/
 ├── docs/
-│   └── ARCHITECTURE.md                 # Complete 6-layer architecture specification & Mermaid diagrams
+│   ├── ARCHITECTURE.md                 # Complete 7-layer architecture specification & Mermaid diagrams
+│   └── PROOFSHIELD_LEARNING_GUIDE.md   # Architectural concepts & implementation walkthrough
 ├── fixtures/                           # Synthetic JSONL test datasets
 │   ├── alerts_v1.jsonl                 # Security alerts (Wazuh, Sigma, EDR)
 │   ├── detection_rules_v1.jsonl        # Sigma & Wazuh detection rules
@@ -151,12 +155,14 @@ PROOFSHIELD/
 │   ├── scenarios_v1.jsonl              # Test scenario definitions with ground truth
 │   └── test_runs_v1.jsonl              # Synthetic execution records
 ├── scripts/
-│   └── demo.py                         # Standalone interactive terminal demonstration
+│   ├── demo.py                         # Standalone interactive terminal demonstration
+│   └── run_benchmark.py                # Automated benchmark runner across storage backends
 ├── src/
 │   └── proofshield/
 │       ├── __init__.py                 # Package metadata and version definition
 │       ├── main.py                     # FastAPI application factory & entry point
 │       ├── api/                        # Layer 6 REST endpoints
+│       │   ├── routes_campaigns.py     # Campaign CRUD, execution, replay, report & comparison routes
 │       │   ├── routes_evaluation.py    # Diagnostic evaluation & entity CRUD routes
 │       │   ├── routes_health.py        # Health probe endpoints
 │       │   └── routes_telemetry.py     # Ingestion & normalisation routes
@@ -165,6 +171,7 @@ PROOFSHIELD/
 │       │   └── engine.py               # Sysmon, Generic EDR, Fallback normalisers & token extraction
 │       ├── schemas/                    # Layer 1 Versioned Pydantic models
 │       │   ├── alert.py                # AlertV1 schema
+│       │   ├── campaign.py             # CampaignDefinitionV1, CampaignRunV1, Manifest, Comparison schemas
 │       │   ├── common.py               # Shared enums, diagnostic categories, base model
 │       │   ├── detection_rule.py       # DetectionRuleV1 schema
 │       │   ├── diagnosis.py            # DiagnosticResultV1 schema (7 categories)
@@ -173,32 +180,26 @@ PROOFSHIELD/
 │       │   ├── telemetry.py            # RawTelemetryEventV1 & NormalizedTelemetryEventV1
 │       │   └── test_run.py             # TestRunV1 schema
 │       ├── services/                   # Layer 5 Assurance Engine & Layer 2 Storage
+│       │   ├── base_store.py           # StoreProtocol definition including campaign interfaces
+│       │   ├── campaign_comparison.py  # Deterministic campaign run regression & diff engine
+│       │   ├── campaign_engine.py      # Layer 7 Detection Validation Campaign Engine & Replay
+│       │   ├── canonical.py            # RFC 8785 canonical JSON serialization & SHA-256 hashing
 │       │   ├── evaluation.py           # Layer 5 Deterministic Assurance Engine
+│       │   ├── sqlite_store.py         # SQLiteStore persistent implementation with WAL & savepoints
 │       │   └── store.py                # Layer 2 In-memory entity store & correlation engine
 │       └── storage/                    # Layer 2 Streaming JSONL
 │           └── jsonl_loader.py         # Streaming JSONL reader & schema validator
-├── tests/                              # Comprehensive test suite (314 tests across 21 modules)
+├── tests/                              # Comprehensive test suite (451 tests across 29 modules)
 │   ├── conftest.py                     # Shared pytest fixtures
-│   ├── test_api_endpoints.py           # REST API contracts & evaluation routes
-│   ├── test_api_sqlite.py              # SQLite API integration & persistence tests
-│   ├── test_api_telemetry_persistence.py# 15 tests: API telemetry persistence bridge & atomic transactions
-│   ├── test_benchmark.py               # Benchmark runner & dataset verification
-│   ├── test_benchmark_framework.py     # 25-case benchmark suite (BM-01 to BM-25)
-│   ├── test_evaluation.py              # Layer 5 Assurance Engine core evaluation logic
-│   ├── test_evidence_integrity.py      # Telemetry evidence immutability & provenance
-│   ├── test_fault_matrix.py            # Fault-Injection Matrix (FT-01 to FT-12)
-│   ├── test_health.py                  # Health check probes
-│   ├── test_jsonl_import.py            # JSONL streaming parsing, error isolation & serialization
-│   ├── test_multidimensional_signatures.py# 23 tests: IP, port, path, hash, user, underspecified guards & adversarial regression tests
-│   ├── test_normalisation.py           # Sysmon, Generic EDR, auditd & fallback normalisers
-│   ├── test_operational_hardening.py   # Boundary conditions, timeouts & edge cases
-│   ├── test_schemas.py                 # Pydantic v2 schema validation & constraint enforcement
-│   ├── test_sqlite_audit.py            # SQLite pragma & schema audits
-│   ├── test_sqlite_parity.py           # Relational vs in-memory operational parity
-│   ├── test_sqlite_store.py            # SQLiteStore CRUD & connection management
-│   ├── test_storage_configuration.py   # Pluggable backend environment selection
-│   ├── test_store.py                   # In-memory entity store CRUD, indexing & host matching
-│   ├── test_store_contract.py          # Formal StoreProtocol contract validation across backends
+│   ├── test_campaign_adversarial.py    # Adversarial nesting, script injection & idempotency tests
+│   ├── test_campaign_api.py            # FastAPI campaign routes, replay & comparison tests
+│   ├── test_campaign_audit_phase16_1.py# Phase 16.1 RFC 8785, content-hash manifest & immutability audit
+│   ├── test_campaign_comparison.py     # Deterministic comparison, regressions, improvements & deltas
+│   ├── test_campaign_engine.py         # Campaign runner, failure isolation, determinism & root-cause
+│   ├── test_campaign_replay.py         # Replay verification, altered/missing evidence & immutability
+│   ├── test_campaign_schemas.py        # Schema validation, regex constraints & metric denominators
+│   ├── test_campaign_storage.py        # Campaign storage parity across InMemoryStore and SQLiteStore
+│   ├── ...                             # 20 additional baseline test modules
 │   └── test_token_attribution.py       # Execution-token attribution & strict verification
 ├── pyproject.toml                      # Standard Python packaging configuration
 ├── requirements.txt                    # Pinned core and dev dependencies
@@ -287,6 +288,78 @@ Response:
   }
 }
 ```
+
+---
+
+## Detection Validation Campaigns (Phase 16)
+
+Phase 16 introduces **Detection Validation Campaigns**, an automated engine that groups individual scenarios into reproducible validation suites, executes the deterministic assurance workflow across each scenario, cryptographically fingerprints collected evidence into an **auditable evidence manifest**, and supports non-destructive replays and regression comparisons.
+
+### Beginner Explanation: The End-to-End Campaign Workflow
+
+If you are learning how PROOFSHIELD works, here is the complete journey of how validation data flows through the system, from authoring a campaign to comparing runs:
+
+`Campaign Definition → Scenario Evaluation → Evidence Capture → Run Persistence → Report → Replay → Comparison`
+
+#### Step-by-Step Walkthrough with a Concrete 3-Scenario Example
+
+Imagine a security team wants to validate three detection behaviors in their environment:
+1. **Scenario 1: `SCN-PS-CRADLE` (PowerShell Download Cradle)**
+   - Expected: Telemetry observed + Wazuh rule `RULE-WIN-PS-CRADLE-01` fires + Alert arrives on `WS-01`.
+   - What happens: The endpoint sensor captures the PowerShell command line, and Wazuh emits the alert.
+   - Outcome: **`PASS`**.
+2. **Scenario 2: `SCN-LSASS-DUMP` (Procdump LSASS Memory Access)**
+   - Expected: Telemetry observed + Alert correlated to target host `DC-PROD-01`.
+   - What happens: Telemetry is observed, and the detection rule fires, but the SIEM misroutes the alert to hostname `DC-PROD-02`.
+   - Outcome: **`ALERT_NOT_CORRELATED`** (The rule worked, but SIEM alert routing failed).
+3. **Scenario 3: `SCN-NET-RECON` (Internal Port Scan / Reconnaissance)**
+   - Expected: Network telemetry captured on `WS-02` + Port scan alert correlated.
+   - What happens: The endpoint sensor on `WS-02` was stopped or the pipeline dropped logs (0 network events recorded).
+   - Outcome: **`EXPECTED_TELEMETRY_MISSING`** (Sensor blackout; rule never had telemetry to inspect).
+
+Here is how PROOFSHIELD processes these three scenarios step-by-step:
+
+1. **Campaign Definition (`CampaignDefinitionV1`)**
+   In `src/proofshield/schemas/campaign.py`, you define a campaign `CAMP-PROD-VALIDATION-01` listing `ordered_scenario_ids = ["SCN-PS-CRADLE", "SCN-LSASS-DUMP", "SCN-NET-RECON"]`. You configure execution policy `CONTINUE_ON_ERROR` so that a failure in one scenario does not stop the others.
+
+2. **Scenario Evaluation (`AssuranceEngine.evaluate_run`)**
+   The `CampaignEngine` (`src/proofshield/services/campaign_engine.py`) takes each scenario in declared order, looks up the corresponding `TestRunV1`, and invokes `AssuranceEngine.evaluate_run(test_run_id)`. The Assurance Engine checks:
+   - Did the test run execute?
+   - Is telemetry present within the target host and observation window?
+   - Does the telemetry match the process/network/file signature?
+   - Did the expected detection rule fire?
+   - Is the resulting alert correlated in time and space?
+
+3. **Evidence Capture & Manifest Hashing (`EvidenceManifestV1` & `canonical_sha256`)**
+   Every piece of evidence supporting or contradicting each verdict is captured. All scenario definitions, test runs, normalized telemetry event payloads, alert payloads, ground-truth records, and execution configuration are canonicalized into an `EvidenceManifestV1` ([canonical.py](file:///D:/PROOFSHIELD/src/proofshield/services/canonical.py)). A deterministic SHA-256 digest is computed over the RFC 8785 canonical JSON bytes.
+
+   > [!IMPORTANT]
+   > **Integrity Scope & Threat Model**:
+   > - **What ProofShield implements today**: Hash verification computes a deterministic SHA-256 digest over canonical evidence bytes and compares evidence payloads against stored manifest hashes during replay. This detects accidental data modification, entity substitution, or record drift relative to the stored reference digest.
+   > - **Limits of local SHA-256 hashing**: SHA-256 alone does not prevent adversarial tampering if an attacker possesses write permissions to both the evidence records and their stored manifest digest, as an attacker could recompute a valid hash over forged inputs.
+   > - **Future hardening**: Stronger tamper resistance requires independently protected reference digests—for example, via access-controlled append-only storage, an out-of-band audit logging system, or cryptographic digital signatures backed by a protected private signing key.
+   > - **Authenticity vs Truthfulness**: Even a valid digital signature or matching hash proves only that a specific payload or signing key created the record; it does not by itself prove that the original endpoint telemetry was truthful, unevaded, or faithfully captured by the sensor.
+
+4. **Run Persistence (`InMemoryStore` or `SQLiteStore`)**
+   The entire execution record—including start/end timestamps, per-scenario results, root-cause groups, summary metrics, and the evidence manifest—is saved atomically as a `CampaignRunV1`. In SQLite mode, this is committed to `campaign_runs` with foreign key integrity.
+
+5. **Deterministic Report & Root-Cause Grouping (`CampaignSummaryV1`)**
+   The engine aggregates findings:
+   - Scenarios: 3 total, 3 executed (100% coverage).
+   - `pass_rate`: 1 / 3 (33.3%).
+   - Root-cause grouping:
+     - Group 1: `ALERT_CORRELATION_FAILURE` affects 1 scenario (`SCN-LSASS-DUMP`).
+     - Group 2: `MISSING_EXPECTED_TELEMETRY` affects 1 scenario (`SCN-NET-RECON`).
+   This immediately tells detection engineers: "1 rule passed, 1 rule worked but alert routing is broken, and 1 sensor is dead."
+
+6. **Replay Engine (`CampaignEngine.replay_campaign_run`)**
+   Weeks later, detection engineers patch the SIEM routing rules and want to verify their evaluation logic without re-executing attacks. They call `POST /api/v1/campaign-runs/{run_id}/replay`. PROOFSHIELD loads the historical evidence manifest, verifies all evidence records exist in the store, and creates a *new* replay run (`is_replay=True`) linked to the original `source_run_id`. The original historical run is never overwritten.
+
+7. **Run Comparison (`CampaignComparisonEngine.compare_runs`)**
+   The engineers compare the original run with a new run using `GET /api/v1/campaign-runs/{run_id}/compare/{other_run_id}`. The engine reports:
+   - `regressions`: [] (nothing broke).
+   - `improvements`: [`SCN-LSASS-DUMP`] (moved from `ALERT_NOT_CORRELATED` to `PASS` after routing fix).
+   - `manifest_match`: `False` (new alerts ingested).
 
 ---
 

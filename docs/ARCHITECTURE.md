@@ -207,6 +207,82 @@ $$\text{ESC} = \frac{\sum_{i=1}^N \mathbb{I}(\text{EvidenceValid}_i)}{N}$$
 
 ---
 
+## Layer 7: Detection Validation Campaign Engine (Phase 16)
+
+Phase 16 extends PROOFSHIELD from single-run ad-hoc evaluation to automated, deterministic **Detection Validation Campaigns**, auditable evidence manifests, replay verification, and regression comparisons.
+
+### 1. Campaign Domain Architecture
+
+The campaign domain model resides in `src/proofshield/schemas/campaign.py`:
+
+- **`CampaignDefinitionV1`**: Declares a collection of validation scenarios to test, execution configuration (`ExecutionConfigV1`), tags, and metadata. Enforces identifier regexes, disallows executable script injections, and prevents empty scenario sets.
+- **`CampaignRunV1`**: Record of an executed campaign instance tracking lifecycle status (`PENDING`, `RUNNING`, `COMPLETED`, `COMPLETED_WITH_ERRORS`, `FAILED`), scenario counts, per-scenario results (`ScenarioCampaignResultV1`), aggregated root-cause groups (`RootCauseGroupV1`), summary metrics (`CampaignSummaryV1`), evidence manifests (`EvidenceManifestV1`), and replay linkage (`source_run_id`, `is_replay`).
+- **`EvidenceManifestV1`**: Cryptographically verifiable manifest referencing all input scenarios, test runs, normalized telemetry IDs, alert IDs, and ground-truth IDs, secured with a canonical SHA-256 hash.
+- **`CampaignComparisonV1`**: Deterministic diff between two campaign runs isolating regressions, improvements, newly inconclusive scenarios, added/removed scenarios, manifest divergences, and metric deltas.
+
+### 2. Campaign Lifecycle & Execution Engine
+
+Implemented in `src/proofshield/services/campaign_engine.py`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: Create Campaign Run Record
+    PENDING --> RUNNING: Acquire Lock & Validate Manifest
+    RUNNING --> COMPLETED: All Scenarios Evaluated Successfully
+    RUNNING --> COMPLETED_WITH_ERRORS: Scenarios Failed under CONTINUE_ON_ERROR
+    RUNNING --> FAILED: Critical Failure or STOP_ON_ERROR Triggered
+    COMPLETED --> [*]
+    COMPLETED_WITH_ERRORS --> [*]
+    FAILED --> [*]
+```
+
+#### Execution Policies
+1. **`CONTINUE_ON_ERROR`** (Default): If an unhandled exception or critical error occurs during a scenario evaluation, that scenario is recorded with status `ERROR`, and execution proceeds to the next scenario. The run concludes with status `COMPLETED_WITH_ERRORS`.
+2. **`STOP_ON_ERROR`**: If any scenario encounters an evaluation error, execution halts immediately. Remaining scenarios are marked `SKIPPED`, and the run concludes with status `FAILED`.
+
+### 3. Evidence Integrity & Canonicalization
+
+Implemented in `src/proofshield/services/canonical.py`:
+- **RFC 8785 Canonical JSON (JCS)**: Full conformance with RFC 8785 / ECMAScript 7.1.12.1 in pure Python without extra dependencies. Implements ECMAScript float-to-string conversion (e.g. `1.0` -> `1`, `-0.0` -> `0`, `1e20` -> `100000000000000000000`), UTF-16 code-unit property sorting (e.g. astral characters like `\U0001D11E` sorted before `\uFFFF`), character escaping, and strict rejection of NaN and Infinity. Cross-validated against Node.js reference engine.
+- **Canonical SHA-256**: Generates SHA-256 digests over canonical UTF-8 bytes of scenarios, test runs, normalized telemetry events, alerts, ground truth records, and execution configuration.
+- **Evidence Content Binding**: In `src/proofshield/schemas/campaign.py`, `ScenarioEvidenceRefV1` and `EvidenceManifestV1` bind the full cryptographic SHA-256 content hashes of every normalized event (`telemetry_event_hashes`), alert (`alert_hashes`), ground truth (`ground_truth_hash`), and configuration (`execution_config_hash`).
+- **Integrity Scope & Threat Model**:
+  - *Implemented Detection*: Hash verification compares evidence payload digests against stored manifest hashes during replay. This detects accidental corruption, record drift, or substitution of evidence records relative to a known digest.
+  - *Adversarial Boundary*: SHA-256 hashing alone does not prevent deliberate tampering if an attacker has write access to both the evidence store and the stored manifest digest, as the attacker can recompute matching hashes over manipulated evidence.
+  - *Future Hardening*: Stronger tamper evidence requires independently protected reference digests, such as access-controlled append-only storage, an out-of-band audit logging system, or digital signatures backed by a protected private signing key.
+  - *Authenticity vs Truthfulness*: A digital signature or cryptographic hash proves only that a particular payload or private key signed/produced the data; it does not by itself prove that the original endpoint telemetry was truthful, unevaded, or faithfully captured by the sensor at operating system level.
+
+### 4. Replay Engine & Replay Classifications
+
+The replay engine (`CampaignEngine.replay_campaign_run`) re-evaluates a historical campaign against previously captured, immutable evidence:
+- **Historical Immutability**: The original `CampaignRunV1` is never modified or overwritten. Replay creates an independent run with `is_replay=True` and `source_run_id` set to the original run ID.
+- **Manifest Internal Hash Verification**: Reconstructs the canonical manifest hash from its components; if the stored manifest has been tampered with or is inconsistent, flags `manifest_valid=False`.
+- **Deep Content Verification**: Compares the SHA-256 content hashes of every scenario, test run, telemetry event, alert, and ground truth record currently in storage against the recorded hashes in the manifest.
+- **Explicit Replay Classifications**:
+  1. `EXACT_REPLAY`: Manifest is valid, zero missing or altered evidence, matching engine version, matching execution configuration, and identical diagnostic outcomes.
+  2. `EVIDENCE_REEVALUATION`: Evidence or scenario definitions were modified, replaced, or deleted in storage.
+  3. `ENGINE_COMPARISON`: Evidence is identical, but evaluated under a different engine version or execution configuration.
+  4. `INVALID_MANIFEST`: The evidence manifest failed internal cryptographic hash verification.
+- **No Active Execution**: Replay operates strictly in memory/database against historical evidence; it never contacts external endpoints or executes offensive payloads.
+
+### 5. Metric Aggregation & Explicit Denominators
+
+All campaign-level metrics in `CampaignSummaryV1` define explicit mathematical denominators:
+- **`pass_rate`**: $\frac{\text{Passed Scenarios}}{\text{Executed Scenarios}}$ (excludes `TEST_NOT_EXECUTED` and `SKIPPED`; reported as `None` if executed scenarios = 0).
+- **`execution_coverage`**: $\frac{\text{Executed Scenarios}}{\text{Total Scenarios}}$
+- **`inconclusive_rate`**: $\frac{\text{Inconclusive Scenarios}}{\text{Executed Scenarios}}$
+- **`error_rate`**: $\frac{\text{Error Scenarios}}{\text{Total Scenarios}}$
+- **`evidence_completeness`**: $\frac{\text{Complete Evidence Scenarios}}{\text{Executed Scenarios}}$
+- **`precision`, `recall`, `f1`**: Computed exclusively when valid ground truth is available; reported as `None` if ground truth is absent.
+
+### 6. Storage Parity & Isolation Semantics
+
+Campaign definitions and runs are fully integrated into `StoreProtocol` with complete parity across `InMemoryStore` and `SQLiteStore`:
+- **`InMemoryStore`**: Thread-safe operations protected by re-entrant locks (`threading.RLock`) and snapshot rollbacks during transactions.
+- **`SQLiteStore`**: Relational tables (`campaigns`, `campaign_runs`) using foreign key constraints, indexes on `campaign_id` and `started_at`, and WAL mode transactions.
+
+---
+
 ## Research Validity, Synthetic Benchmarks & Explicit Non-Claims
 
 ### Synthetic Benchmark Scope

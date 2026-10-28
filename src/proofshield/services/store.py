@@ -13,6 +13,7 @@ from typing import Any, Dict, Generator, List, Optional, Union
 
 from proofshield.normalisation.engine import extract_execution_token
 from proofshield.schemas.alert import AlertV1
+from proofshield.schemas.campaign import CampaignDefinitionV1, CampaignRunV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
 from proofshield.schemas.ground_truth import GroundTruthV1
@@ -20,7 +21,7 @@ from proofshield.schemas.scenario import ScenarioV1
 from proofshield.schemas.telemetry import NormalizedTelemetryEventV1, RawTelemetryEventV1
 from proofshield.config import StorageBackend, get_settings
 from proofshield.schemas.test_run import TestRunV1
-from proofshield.services.base_store import StoreProtocol
+from proofshield.services.base_store import StoreProtocol, to_comparable_utc
 
 
 def hosts_match(host1: str, host2: str) -> bool:
@@ -81,6 +82,8 @@ class InMemoryStore:
         self._alerts: Dict[str, AlertV1] = {}
         self._results: Dict[str, DiagnosticResultV1] = {}
         self._ground_truths: Dict[str, GroundTruthV1] = {}
+        self._campaigns: Dict[str, CampaignDefinitionV1] = {}
+        self._campaign_runs: Dict[str, CampaignRunV1] = {}
 
     def reset(self) -> None:
         """Clear all stored data. Used for test isolation."""
@@ -93,6 +96,12 @@ class InMemoryStore:
             self._alerts.clear()
             self._results.clear()
             self._ground_truths.clear()
+            self._campaigns.clear()
+            self._campaign_runs.clear()
+
+    def close(self) -> None:
+        """No-op close method to satisfy store lifecycle uniformity."""
+        pass
 
     @contextmanager
     def transaction(self) -> Generator[None, None, None]:
@@ -111,6 +120,8 @@ class InMemoryStore:
                 "alerts": dict(self._alerts),
                 "results": dict(self._results),
                 "ground_truths": dict(self._ground_truths),
+                "campaigns": dict(self._campaigns),
+                "campaign_runs": dict(self._campaign_runs),
             }
             try:
                 yield
@@ -123,6 +134,8 @@ class InMemoryStore:
                 self._alerts = snapshot["alerts"]
                 self._results = snapshot["results"]
                 self._ground_truths = snapshot["ground_truths"]
+                self._campaigns = snapshot["campaigns"]
+                self._campaign_runs = snapshot["campaign_runs"]
                 raise
 
     # ── Scenarios ─────────────────────────────────────────────────────────
@@ -410,6 +423,60 @@ class InMemoryStore:
     def list_ground_truths(self) -> List[GroundTruthV1]:
         with self._lock:
             return list(self._ground_truths.values())
+
+    # ── Campaigns ─────────────────────────────────────────────────────────
+
+    def add_campaign(self, campaign: CampaignDefinitionV1) -> CampaignDefinitionV1:
+        """Register a campaign definition. Raises ValueError on duplicate ID."""
+        with self._lock:
+            if campaign.campaign_id in self._campaigns:
+                raise ValueError(f"Campaign already exists: {campaign.campaign_id}")
+            self._campaigns[campaign.campaign_id] = campaign.model_copy(deep=True)
+            return campaign.model_copy(deep=True)
+
+    def get_campaign(self, campaign_id: str) -> Optional[CampaignDefinitionV1]:
+        """Retrieve a campaign definition by its identifier (returns immutable deep copy)."""
+        with self._lock:
+            item = self._campaigns.get(campaign_id)
+            return item.model_copy(deep=True) if item else None
+
+    def list_campaigns(self) -> List[CampaignDefinitionV1]:
+        """List all registered campaign definitions, ordered deterministically by creation timestamp."""
+        with self._lock:
+            sorted_items = sorted(
+                list(self._campaigns.values()),
+                key=lambda c: to_comparable_utc(c.created_at),
+            )
+            return [c.model_copy(deep=True) for c in sorted_items]
+
+    # ── Campaign Runs ─────────────────────────────────────────────────────
+
+    def add_campaign_run(self, run: CampaignRunV1) -> CampaignRunV1:
+        """Record an executed campaign run. Raises ValueError on duplicate ID or missing campaign."""
+        with self._lock:
+            if run.run_id in self._campaign_runs:
+                raise ValueError(f"Campaign run already exists: {run.run_id}")
+            if run.campaign_id not in self._campaigns:
+                raise ValueError(f"Campaign not found: {run.campaign_id}")
+            self._campaign_runs[run.run_id] = run.model_copy(deep=True)
+            return run.model_copy(deep=True)
+
+    def get_campaign_run(self, run_id: str) -> Optional[CampaignRunV1]:
+        """Retrieve an executed campaign run by its identifier (returns immutable deep copy)."""
+        with self._lock:
+            item = self._campaign_runs.get(run_id)
+            return item.model_copy(deep=True) if item else None
+
+    def list_campaign_runs(
+        self, campaign_id: Optional[str] = None
+    ) -> List[CampaignRunV1]:
+        """List campaign runs, optionally filtered by campaign ID, ordered by start time."""
+        with self._lock:
+            runs = list(self._campaign_runs.values())
+            if campaign_id is not None:
+                runs = [r for r in runs if r.campaign_id == campaign_id]
+            sorted_runs = sorted(runs, key=lambda r: to_comparable_utc(r.started_at))
+            return [r.model_copy(deep=True) for r in sorted_runs]
 
 
 # Module-level singleton
