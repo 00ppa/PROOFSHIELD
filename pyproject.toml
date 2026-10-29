@@ -9,8 +9,16 @@ description = "PROOFSHIELD: Cybersecurity Detection Assurance and Failure-Diagno
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
-    { name = "PROOFSHIELD Engineering Team" }
+    { name = "FS", email = "159800057+00ppa@users.noreply.github.com" },
 ]
+maintainers = [
+    { name = "FS", email = "159800057+00ppa@users.noreply.github.com" },
+]
+
+[project.urls]
+Homepage = "https://github.com/00ppa/PROOFSHIELD"
+Repository = "https://github.com/00ppa/PROOFSHIELD"
+Issues = "https://github.com/00ppa/PROOFSHIELD/issues"
 dependencies = [
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.28.0",

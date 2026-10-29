@@ -5,3 +5,5 @@ and deterministic detection evaluation.
 """
 
 __version__ = "0.1.0"
+__author__ = "FS"
+__email__ = "159800057+00ppa@users.noreply.github.com"
