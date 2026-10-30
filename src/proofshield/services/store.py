@@ -13,6 +13,7 @@ from typing import Any, Dict, Generator, List, Optional, Union
 
 from proofshield.normalisation.engine import extract_execution_token
 from proofshield.schemas.alert import AlertV1
+from proofshield.schemas.assurance_report import CampaignAssuranceReportV1
 from proofshield.schemas.campaign import CampaignDefinitionV1, CampaignRunV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
@@ -84,6 +85,7 @@ class InMemoryStore:
         self._ground_truths: Dict[str, GroundTruthV1] = {}
         self._campaigns: Dict[str, CampaignDefinitionV1] = {}
         self._campaign_runs: Dict[str, CampaignRunV1] = {}
+        self._assurance_reports: Dict[str, CampaignAssuranceReportV1] = {}
 
     def reset(self) -> None:
         """Clear all stored data. Used for test isolation."""
@@ -98,6 +100,7 @@ class InMemoryStore:
             self._ground_truths.clear()
             self._campaigns.clear()
             self._campaign_runs.clear()
+            self._assurance_reports.clear()
 
     def close(self) -> None:
         """No-op close method to satisfy store lifecycle uniformity."""
@@ -122,6 +125,7 @@ class InMemoryStore:
                 "ground_truths": dict(self._ground_truths),
                 "campaigns": dict(self._campaigns),
                 "campaign_runs": dict(self._campaign_runs),
+                "assurance_reports": dict(self._assurance_reports),
             }
             try:
                 yield
@@ -136,6 +140,7 @@ class InMemoryStore:
                 self._ground_truths = snapshot["ground_truths"]
                 self._campaigns = snapshot["campaigns"]
                 self._campaign_runs = snapshot["campaign_runs"]
+                self._assurance_reports = snapshot["assurance_reports"]
                 raise
 
     # ── Scenarios ─────────────────────────────────────────────────────────
@@ -477,6 +482,43 @@ class InMemoryStore:
                 runs = [r for r in runs if r.campaign_id == campaign_id]
             sorted_runs = sorted(runs, key=lambda r: to_comparable_utc(r.started_at))
             return [r.model_copy(deep=True) for r in sorted_runs]
+
+    # ── Campaign Assurance Reports ────────────────────────────────────────
+
+    def add_assurance_report(
+        self, report: CampaignAssuranceReportV1
+    ) -> CampaignAssuranceReportV1:
+        """Record an assurance report. Raises ValueError on duplicate ID or missing campaign run."""
+        with self._lock:
+            if report.report_id in self._assurance_reports:
+                raise ValueError(f"Assurance report already exists: {report.report_id}")
+            if report.campaign_id not in self._campaigns:
+                raise ValueError(f"Campaign not found: {report.campaign_id}")
+            if report.campaign_run_id not in self._campaign_runs:
+                raise ValueError(f"Campaign run not found: {report.campaign_run_id}")
+            self._assurance_reports[report.report_id] = report.model_copy(deep=True)
+            return report.model_copy(deep=True)
+
+    def get_assurance_report(
+        self, report_id: str
+    ) -> Optional[CampaignAssuranceReportV1]:
+        """Retrieve an assurance report by its identifier (returns immutable deep copy)."""
+        with self._lock:
+            item = self._assurance_reports.get(report_id)
+            return item.model_copy(deep=True) if item else None
+
+    def list_assurance_reports(
+        self, campaign_id: Optional[str] = None, run_id: Optional[str] = None
+    ) -> List[CampaignAssuranceReportV1]:
+        """List assurance reports, optionally filtered by campaign ID or run ID, ordered by generation time."""
+        with self._lock:
+            reports = list(self._assurance_reports.values())
+            if campaign_id is not None:
+                reports = [r for r in reports if r.campaign_id == campaign_id]
+            if run_id is not None:
+                reports = [r for r in reports if r.campaign_run_id == run_id]
+            sorted_reports = sorted(reports, key=lambda r: to_comparable_utc(r.generated_at))
+            return [r.model_copy(deep=True) for r in sorted_reports]
 
 
 # Module-level singleton

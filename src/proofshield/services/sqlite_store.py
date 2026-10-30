@@ -20,6 +20,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 from proofshield.config import validate_sqlite_path
 from proofshield.normalisation.engine import extract_execution_token
 from proofshield.schemas.alert import AlertV1
+from proofshield.schemas.assurance_report import CampaignAssuranceReportV1
 from proofshield.schemas.campaign import CampaignDefinitionV1, CampaignRunV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
@@ -426,7 +427,31 @@ class SQLiteStore:
                 "CREATE INDEX IF NOT EXISTS idx_campaign_runs_started ON campaign_runs(started_at);"
             )
 
-            # 11. Verify physical schema integrity across all core tables
+            # 11. Campaign Assurance Reports
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS campaign_assurance_reports (
+                    report_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES campaign_runs(run_id) ON DELETE RESTRICT,
+                    campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id) ON DELETE RESTRICT,
+                    report_digest TEXT NOT NULL,
+                    generated_at TEXT NOT NULL,
+                    is_complete INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_campaign_assurance_reports_campaign ON campaign_assurance_reports(campaign_id);"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_campaign_assurance_reports_run ON campaign_assurance_reports(run_id);"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_campaign_assurance_reports_generated ON campaign_assurance_reports(generated_at);"
+            )
+
+            # 12. Verify physical schema integrity across all core tables
             required_columns = {
                 "scenarios": {"scenario_id", "name", "mitre_technique_id", "payload_json"},
                 "test_runs": {"run_id", "scenario_id", "execution_mode", "payload_json"},
@@ -438,6 +463,7 @@ class SQLiteStore:
                 "ground_truths": {"ground_truth_id", "payload_json"},
                 "campaigns": {"campaign_id", "name", "created_at", "payload_json"},
                 "campaign_runs": {"run_id", "campaign_id", "status", "is_replay", "started_at", "payload_json"},
+                "campaign_assurance_reports": {"report_id", "run_id", "campaign_id", "report_digest", "generated_at", "is_complete", "payload_json"},
             }
             for tbl, expected_cols in required_columns.items():
                 cursor.execute(f"PRAGMA table_info({tbl});")
@@ -489,10 +515,11 @@ class SQLiteStore:
         self.close()
 
     def reset(self) -> None:
-        """Clear all stored data across all 8 tables within an atomic transaction."""
+        """Clear all stored data across all tables within an atomic transaction."""
         self._check_open()
         with self.transaction() as cursor:
             # Delete child tables before parent tables to respect foreign keys
+            cursor.execute("DELETE FROM campaign_assurance_reports;")
             cursor.execute("DELETE FROM campaign_runs;")
             cursor.execute("DELETE FROM campaigns;")
             cursor.execute("DELETE FROM ground_truths;")
@@ -1293,5 +1320,107 @@ class SQLiteStore:
                         "SELECT payload_json FROM campaign_runs ORDER BY started_at ASC;"
                     )
                 return [CampaignRunV1.model_validate_json(r[0]) for r in cursor.fetchall()]
+            finally:
+                cursor.close()
+
+    # ── Campaign Assurance Reports ────────────────────────────────────────
+
+    def add_assurance_report(
+        self, report: CampaignAssuranceReportV1
+    ) -> CampaignAssuranceReportV1:
+        """Record an assurance report. Raises ValueError on duplicate ID or missing campaign run."""
+        with self._lock:
+            self._check_open()
+            with self.transaction() as cursor:
+                # 1. Validate foreign keys: campaign run and campaign must exist
+                cursor.execute(
+                    "SELECT 1 FROM campaign_runs WHERE run_id = ?;",
+                    (report.campaign_run_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError(f"Campaign run not found: {report.campaign_run_id}")
+
+                cursor.execute(
+                    "SELECT 1 FROM campaigns WHERE campaign_id = ?;",
+                    (report.campaign_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError(f"Campaign not found: {report.campaign_id}")
+
+                # 2. Check duplicate report ID
+                cursor.execute(
+                    "SELECT 1 FROM campaign_assurance_reports WHERE report_id = ?;",
+                    (report.report_id,),
+                )
+                if cursor.fetchone() is not None:
+                    raise ValueError(f"Assurance report already exists: {report.report_id}")
+
+                # 3. Insert report
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO campaign_assurance_reports (
+                            report_id, run_id, campaign_id, report_digest, generated_at, is_complete, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        (
+                            report.report_id,
+                            report.campaign_run_id,
+                            report.campaign_id,
+                            report.report_digest,
+                            to_canonical_utc_iso(report.generated_at),
+                            1 if report.is_complete else 0,
+                            report.model_dump_json(),
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError(f"Assurance report integrity error: {exc}") from exc
+            return report
+
+    def get_assurance_report(
+        self, report_id: str
+    ) -> Optional[CampaignAssuranceReportV1]:
+        """Retrieve an assurance report by its identifier."""
+        with self._lock:
+            self._check_open()
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    "SELECT payload_json FROM campaign_assurance_reports WHERE report_id = ?;",
+                    (report_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return CampaignAssuranceReportV1.model_validate_json(row[0])
+            finally:
+                cursor.close()
+
+    def list_assurance_reports(
+        self, campaign_id: Optional[str] = None, run_id: Optional[str] = None
+    ) -> List[CampaignAssuranceReportV1]:
+        """List assurance reports, optionally filtered by campaign ID or run ID, ordered by generation time."""
+        with self._lock:
+            self._check_open()
+            cursor = self.connection.cursor()
+            try:
+                query = "SELECT payload_json FROM campaign_assurance_reports"
+                params: List[Any] = []
+                conditions: List[str] = []
+
+                if campaign_id is not None:
+                    conditions.append("campaign_id = ?")
+                    params.append(campaign_id)
+                if run_id is not None:
+                    conditions.append("run_id = ?")
+                    params.append(run_id)
+
+                if conditions:
+                    query += " WHERE " + " AND ".join(conditions)
+
+                query += " ORDER BY generated_at ASC;"
+
+                cursor.execute(query, tuple(params))
+                return [CampaignAssuranceReportV1.model_validate_json(r[0]) for r in cursor.fetchall()]
             finally:
                 cursor.close()

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional, Protocol, runtime_checkable
 
 from proofshield.schemas.alert import AlertV1
+from proofshield.schemas.assurance_report import CampaignAssuranceReportV1
 from proofshield.schemas.campaign import CampaignDefinitionV1, CampaignRunV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
@@ -211,4 +212,24 @@ class StoreProtocol(Protocol):
         self, campaign_id: Optional[str] = None
     ) -> List[CampaignRunV1]:
         """List campaign runs, optionally filtered by campaign ID."""
+        ...
+
+    # ── Campaign Assurance Reports ────────────────────────────────────────
+
+    def add_assurance_report(
+        self, report: CampaignAssuranceReportV1
+    ) -> CampaignAssuranceReportV1:
+        """Record an assurance report. Raises ValueError on duplicate ID or missing campaign run."""
+        ...
+
+    def get_assurance_report(
+        self, report_id: str
+    ) -> Optional[CampaignAssuranceReportV1]:
+        """Retrieve an assurance report by its identifier."""
+        ...
+
+    def list_assurance_reports(
+        self, campaign_id: Optional[str] = None, run_id: Optional[str] = None
+    ) -> List[CampaignAssuranceReportV1]:
+        """List assurance reports, optionally filtered by campaign ID or run ID."""
         ...

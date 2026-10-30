@@ -281,6 +281,52 @@ Campaign definitions and runs are fully integrated into `StoreProtocol` with com
 - **`InMemoryStore`**: Thread-safe operations protected by re-entrant locks (`threading.RLock`) and snapshot rollbacks during transactions.
 - **`SQLiteStore`**: Relational tables (`campaigns`, `campaign_runs`) using foreign key constraints, indexes on `campaign_id` and `started_at`, and WAL mode transactions.
 
+### 7. Campaign Assurance Intelligence & Regression Analysis (Phase 17)
+
+Phase 17 elevates campaign execution records into an auditable intelligence and regression analysis layer:
+
+#### A. Campaign Assurance Report Lifecycle (`CampaignAssuranceReportV1`)
+- **Non-Destructive Aggregation**: Compiles reports directly from historical execution records (`CampaignRunV1`) and stored evidence without re-executing payloads or modifying underlying database rows.
+- **Explicit Detection Assurance Metrics**:
+  - `detection_success_rate`: $\frac{\text{successful\_executions}}{\text{executed\_test\_cases}}$ (excludes unexecuted scenarios; `INSUFFICIENT_DATA` if denominator is 0).
+  - `detection_failure_rate`: $\frac{\text{failed\_executions}}{\text{executed\_test\_cases}}$
+  - `telemetry_availability_rate`: $\frac{\text{executed\_test\_cases} - \text{expected\_telemetry\_missing\_count}}{\text{executed\_test\_cases}}$
+  - `evidence_completeness_rate`: $\frac{\text{executed\_test\_cases} - \text{missing\_evidence\_count}}{\text{executed\_test\_cases}}$
+  - `alert_correlation_rate`: $\frac{\text{correlated\_alert\_scenarios}}{\text{correlated\_alert\_scenarios} + \text{alert\_not\_correlated\_scenarios}}$
+  - `inconclusive_rate`: $\frac{\text{inconclusive\_executions}}{\text{executed\_test\_cases}}$
+  - `execution_coverage`: $\frac{\text{executed\_test\_cases}}{\text{total\_declared\_scenarios}}$
+- **Diagnostic Distribution**: Exact count and percentage breakdowns across the 7 canonical categories (`PASS`, `TEST_NOT_EXECUTED`, `EXPECTED_TELEMETRY_MISSING`, `DETECTION_NOT_TRIGGERED`, `ALERT_NOT_CORRELATED`, `INCONCLUSIVE`, `ERROR`).
+- **Cryptographic Quality Audit**: Verifies stored evidence against manifest hashes; flags `VERIFIED`, `INTEGRITY_COMPROMISED`, `MISSING_EVIDENCE`, `MANIFEST_ABSENT`, or `UNVERIFIED`.
+- **RFC 8785 Canonical Digest**: Every report is sealed with an SHA-256 digest over its deterministic canonical representation. On retrieval, `CampaignAssuranceReportGenerator.verify_report_integrity` verifies bit-for-bit authenticity, detecting tampering or silent data corruption.
+
+#### B. Regression Intelligence (`CampaignRegressionAnalyzer`)
+- **Compatibility Audit**: Evaluates comparability between baseline and candidate runs before generating comparative claims. Identifies:
+  - Disjoint scenario suites (flags verdict `INCOMPARABLE`).
+  - Zero executed test cases in baseline or candidate (flags verdict `INSUFFICIENT_DATA`).
+  - Configuration drift (e.g. grace period changes) and engine version drift.
+- **Finding Generation**: Emits deterministic `RegressionFindingV1` records with explicit severities (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFORMATIONAL`) and `is_actionable` flags:
+  - `DETECTION_REGRESSION`: Scenario regressed from PASS to Failure/Error (`CRITICAL` or `HIGH`, actionable).
+  - `DETECTION_IMPROVEMENT`: Previously failing scenario now passes (`INFORMATIONAL`, non-actionable).
+  - `METRIC_DETERIORATION`: Any metric degradation $\le -0.0001$ (`HIGH` or `MEDIUM`, actionable).
+  - `METRIC_IMPROVEMENT`: Metric increase $\ge 0.0001$ (`INFORMATIONAL`).
+  - `TELEMETRY_GAP_INCREASE`, `ALERT_CORRELATION_DETERIORATION`, `INCONCLUSIVE_RATE_INCREASE`, `EVIDENCE_COMPLETENESS_DETERIORATION`.
+- **Verdict Determinism**: Resolves to `REGRESSION`, `IMPROVEMENT`, `NO_CHANGE`, `INSUFFICIENT_DATA`, or `INCOMPARABLE`.
+
+#### C. Root-Cause Intelligence (`RootCauseIntelligenceService`)
+- Aggregates diagnostic failures across scenarios into structured `RootCausePatternV1` groups.
+- Strictly bifurcates empirically **observed facts** from plausible **inferred explanations**.
+- Tracks supporting evidence IDs for independent analyst auditability.
+
+#### D. Storage & REST API
+- **Storage Parity**: New entity `campaign_assurance_reports` implemented across `InMemoryStore` and `SQLiteStore` (with foreign keys to `campaigns` and `campaign_runs`, transaction rollback safety, and indexes).
+- **Versioned Endpoints**:
+  - `POST /api/v1/campaign-runs/{run_id}/assurance-report`: Compiles and stores an assurance report.
+  - `GET /api/v1/campaign-assurance-reports/{report_id}`: Retrieves an assurance report and validates its canonical content digest.
+  - `GET /api/v1/campaign-assurance-reports`: Lists reports with bounded pagination.
+  - `POST /api/v1/campaign-runs/{run_id}/regression-analysis`: Executes regression analysis against a baseline run.
+  - `GET /api/v1/campaign-runs/{run_id}/regression/{base_run_id}`: Comparative regression shortcut.
+  - `GET /api/v1/campaign-runs/{run_id}/root-cause-intelligence`: Aggregated diagnostic patterns and root-cause intelligence.
+
 ---
 
 ## Research Validity, Synthetic Benchmarks & Explicit Non-Claims

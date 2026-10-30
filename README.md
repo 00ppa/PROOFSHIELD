@@ -4,7 +4,7 @@
 
 - **Author & Maintainer**: FS ([@00ppa](https://github.com/00ppa))
 - **Status**: Research Prototype (v0.1.0)
-- **Test Suite**: 451/451 passing automated tests across 29 modules (15s runtime)
+- **Test Suite**: 499/499 passing automated tests across 33 modules (6s runtime)
 - **Benchmark**: 25 controlled benchmark scenarios (BM-01 to BM-25) + 12-case fault matrix (FT-01 to FT-12)
 - **Architecture Specification**: Detailed specifications in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
@@ -42,6 +42,13 @@
 
 8. **Detection Validation Campaign Engine, Replay & Auditable Evidence (Phase 16)**:
    Orchestrates multi-scenario validation campaigns with deterministic execution ordering, failure isolation policies (`CONTINUE_ON_ERROR` vs `STOP_ON_ERROR`), RFC 8785 canonical evidence manifest hashing (SHA-256), non-destructive replay against immutable captured evidence, regression comparisons (`CampaignComparisonV1`), and root-cause grouping across detection pipelines.
+
+9. **Campaign Assurance Intelligence & Regression Analysis (Phase 17)**:
+   Transforms recorded campaign executions into structured detection assurance intelligence:
+   - **`CampaignAssuranceReportV1`**: Non-destructive report aggregation with explicit mathematical metrics (`detection_success_rate`, `detection_failure_rate`, `telemetry_availability_rate`, `evidence_completeness_rate`, `alert_correlation_rate`, `inconclusive_rate`, `execution_coverage`), 7-category diagnostic distribution, evidence quality audit, and RFC 8785 canonical SHA-256 digest with retrieval tamper detection.
+   - **`CampaignRegressionAnalyzer`**: Evaluates comparability (detecting disjoint scenarios, configuration drift, and engine drift), identifies regressions vs improvements with explicit severities and actionability, and deterministically resolves comparative verdicts (`REGRESSION`, `IMPROVEMENT`, `NO_CHANGE`, `INSUFFICIENT_DATA`, `INCOMPARABLE`).
+   - **`RootCauseIntelligenceService`**: Aggregates failure patterns while strictly separating empirically observed facts from plausible inferred explanations.
+   - **Full Dual-Backend Persistence & REST API**: Extends both `InMemoryStore` and `SQLiteStore` with `campaign_assurance_reports` table, and exposes versioned `/api/v1` endpoints for report compilation, retrieval, regression comparison, and root-cause intelligence.
 
 ---
 
