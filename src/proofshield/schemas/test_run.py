@@ -2,11 +2,12 @@
 
 from datetime import datetime
 from typing import Any, Dict, Literal, Optional
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from proofshield.schemas.common import (
     ExecutionMode,
     ExecutionStatus,
     ProofshieldBaseModel,
+    validate_nesting_depth,
 )
 
 
@@ -61,6 +62,13 @@ class TestRunV1(ProofshieldBaseModel):
         default_factory=dict,
         description="Additional execution metadata (agent version, OS build, etc.)",
     )
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_metadata_depth(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        if v:
+            validate_nesting_depth(v, max_depth=16)
+        return v
 
     @model_validator(mode="after")
     def validate_window(self) -> "TestRunV1":

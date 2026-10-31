@@ -98,10 +98,19 @@ def ecmascript_float(x: float) -> str:
     return sign + res
 
 
-def canonical_jcs_serialize(val: Any) -> str:
-    """Serialize a Python data structure into RFC 8785 (JCS) canonical JSON string."""
+def canonical_jcs_serialize(val: Any, _depth: int = 0, max_depth: int = 64) -> str:
+    """Serialize a Python data structure into RFC 8785 (JCS) canonical JSON string.
+
+    Enforces a strict recursion depth boundary (default: 64) to prevent stack overflow
+    and denial-of-service from deeply nested or cyclic payloads.
+    """
+    if _depth > max_depth:
+        raise ValueError(
+            f"RFC 8785 canonical serialization exceeds maximum nesting depth of {max_depth}."
+        )
+
     if isinstance(val, BaseModel):
-        return canonical_jcs_serialize(val.model_dump(mode="json"))
+        return canonical_jcs_serialize(val.model_dump(mode="json"), _depth=_depth + 1, max_depth=max_depth)
 
     if val is None:
         return "null"
@@ -130,11 +139,11 @@ def canonical_jcs_serialize(val: Any) -> str:
         return json.dumps(val.isoformat(), ensure_ascii=False)
 
     if isinstance(val, (list, tuple)):
-        return "[" + ",".join(canonical_jcs_serialize(item) for item in val) + "]"
+        return "[" + ",".join(canonical_jcs_serialize(item, _depth=_depth + 1, max_depth=max_depth) for item in val) + "]"
 
     if isinstance(val, (set, frozenset)):
         # Deterministically sort sets by serialized UTF-8 bytes
-        items = [canonical_jcs_serialize(item) for item in val]
+        items = [canonical_jcs_serialize(item, _depth=_depth + 1, max_depth=max_depth) for item in val]
         items.sort(key=lambda s: s.encode("utf-8"))
         return "[" + ",".join(items) + "]"
 
@@ -145,7 +154,7 @@ def canonical_jcs_serialize(val: Any) -> str:
         except UnicodeEncodeError as err:
             raise ValueError(f"Unpaired surrogates or invalid Unicode in key not permitted in RFC 8785: {err}") from err
         return "{" + ",".join(
-            json.dumps(str(k), ensure_ascii=False) + ":" + canonical_jcs_serialize(val[k])
+            json.dumps(str(k), ensure_ascii=False) + ":" + canonical_jcs_serialize(val[k], _depth=_depth + 1, max_depth=max_depth)
             for k in sorted_keys
         ) + "}"
 

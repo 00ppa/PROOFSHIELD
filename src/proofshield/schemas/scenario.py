@@ -1,12 +1,13 @@
 """Detection validation scenario schemas."""
 
 from typing import Any, Dict, Literal, Optional
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from proofshield.schemas.common import (
     EventCategory,
     GroundTruthLabel,
     ProofshieldBaseModel,
     ValidationTarget,
+    validate_nesting_depth,
 )
 
 
@@ -84,6 +85,13 @@ class ScenarioV1(ProofshieldBaseModel):
         default_factory=dict,
         description="Arbitrary tags, author info, environment prerequisites",
     )
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_metadata_depth(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        if v:
+            validate_nesting_depth(v, max_depth=16)
+        return v
 
     def has_discriminating_signature(self) -> bool:
         """Check whether the scenario defines at least one discriminating signature field.

@@ -1,7 +1,8 @@
 import sqlite3
 from typing import List, Optional, Union
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Path, Query
 
+from proofshield.api.routes_campaigns import sanitize_error_detail
 from proofshield.schemas import (
     AlertV1,
     DetectionRuleV1,
@@ -31,7 +32,7 @@ def create_scenario(scenario: ScenarioV1) -> ScenarioV1:
     try:
         return store.add_scenario(scenario)
     except (ValueError, sqlite3.Error) as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Scenario registration conflict"))
 
 
 @router.get(
@@ -54,7 +55,15 @@ def list_scenarios(
     response_model=ScenarioV1,
     summary="Get scenario by identifier",
 )
-def get_scenario(scenario_id: str) -> ScenarioV1:
+def get_scenario(
+    scenario_id: str = Path(
+        ...,
+        pattern=r"^[A-Za-z0-9_\-\.]+$",
+        min_length=3,
+        max_length=128,
+        description="Scenario identifier",
+    ),
+) -> ScenarioV1:
     scenario = get_store().get_scenario(scenario_id)
     if not scenario:
         raise HTTPException(status_code=404, detail=f"Scenario not found: {scenario_id}")
@@ -75,8 +84,8 @@ def create_test_run(run: TestRunV1) -> TestRunV1:
         return store.add_run(run)
     except (ValueError, sqlite3.Error) as exc:
         if "Scenario not found" in str(exc):
-            raise HTTPException(status_code=404, detail=str(exc))
-        raise HTTPException(status_code=409, detail=str(exc))
+            raise HTTPException(status_code=404, detail=sanitize_error_detail(exc, prefix="Referenced scenario not found"))
+        raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Run registration conflict"))
 
 
 @router.get(
@@ -100,7 +109,15 @@ def list_test_runs(
     response_model=TestRunV1,
     summary="Get test run by identifier",
 )
-def get_test_run(run_id: str) -> TestRunV1:
+def get_test_run(
+    run_id: str = Path(
+        ...,
+        pattern=r"^[A-Za-z0-9_\-\.]+$",
+        min_length=3,
+        max_length=128,
+        description="Test run identifier",
+    ),
+) -> TestRunV1:
     run = get_store().get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"Test run not found: {run_id}")
@@ -119,7 +136,7 @@ def create_rule(rule: DetectionRuleV1) -> DetectionRuleV1:
     try:
         return store.add_rule(rule)
     except (ValueError, sqlite3.Error) as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Detection rule registration conflict"))
 
 
 @router.get(
@@ -142,7 +159,15 @@ def list_rules(
     response_model=DetectionRuleV1,
     summary="Get detection rule by identifier",
 )
-def get_rule(rule_id: str) -> DetectionRuleV1:
+def get_rule(
+    rule_id: str = Path(
+        ...,
+        pattern=r"^[A-Za-z0-9_\-\.]+$",
+        min_length=3,
+        max_length=128,
+        description="Detection rule identifier",
+    ),
+) -> DetectionRuleV1:
     rule = get_store().get_rule(rule_id)
     if not rule:
         raise HTTPException(status_code=404, detail=f"Detection rule not found: {rule_id}")
@@ -173,7 +198,7 @@ def ingest_alerts(
                 store.add_alert(a)
                 ingested.append(a)
     except (ValueError, sqlite3.Error) as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Alert ingestion conflict"))
     return ingested
 
 
@@ -204,7 +229,7 @@ def create_ground_truth(gt: GroundTruthV1) -> GroundTruthV1:
     try:
         return store.add_ground_truth(gt)
     except (ValueError, sqlite3.Error) as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Ground truth conflict"))
 
 
 @router.get(
@@ -227,7 +252,15 @@ def list_ground_truths(
     response_model=GroundTruthV1,
     summary="Get ground truth for a test run",
 )
-def get_ground_truth_for_run(run_id: str) -> GroundTruthV1:
+def get_ground_truth_for_run(
+    run_id: str = Path(
+        ...,
+        pattern=r"^[A-Za-z0-9_\-\.]+$",
+        min_length=3,
+        max_length=128,
+        description="Test run identifier",
+    ),
+) -> GroundTruthV1:
     gt = get_store().get_ground_truth_for_run(run_id)
     if not gt:
         raise HTTPException(
@@ -244,7 +277,13 @@ def get_ground_truth_for_run(run_id: str) -> GroundTruthV1:
     summary="Trigger deterministic diagnostic evaluation of a test run",
 )
 def evaluate_test_run(
-    run_id: str,
+    run_id: str = Path(
+        ...,
+        pattern=r"^[A-Za-z0-9_\-\.]+$",
+        min_length=3,
+        max_length=128,
+        description="Test run identifier",
+    ),
     strict_attribution: Optional[bool] = Query(
         None,
         description="Opt-in strict token attribution requiring execution token provenance",
@@ -259,9 +298,12 @@ def evaluate_test_run(
     """
     store = get_store()
     engine = AssuranceEngine(store)
-    result = engine.evaluate_run(run_id, strict_attribution=strict_attribution)
-    store.add_result(result)
-    return result
+    try:
+        result = engine.evaluate_run(run_id, strict_attribution=strict_attribution)
+        store.add_result(result)
+        return result
+    except (ValueError, sqlite3.Error) as exc:
+        raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Evaluation failed"))
 
 
 @router.get(
@@ -269,7 +311,15 @@ def evaluate_test_run(
     response_model=DiagnosticResultV1,
     summary="Get latest diagnostic result for a test run",
 )
-def get_evaluation_for_run(run_id: str) -> DiagnosticResultV1:
+def get_evaluation_for_run(
+    run_id: str = Path(
+        ...,
+        pattern=r"^[A-Za-z0-9_\-\.]+$",
+        min_length=3,
+        max_length=128,
+        description="Test run identifier",
+    ),
+) -> DiagnosticResultV1:
     result = get_store().get_result_for_run(run_id)
     if not result:
         raise HTTPException(

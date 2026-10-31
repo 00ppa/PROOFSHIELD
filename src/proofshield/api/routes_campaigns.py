@@ -27,14 +27,25 @@ from proofshield.services.store import get_store
 router = APIRouter(prefix="/api/v1", tags=["Campaign Validation & Replay Engine"])
 
 
-def _sanitize_error_detail(exc: Exception, prefix: str = "Operation failed") -> str:
+def sanitize_error_detail(exc: Exception, prefix: str = "Operation failed") -> str:
     """Sanitize error messages to prevent leakage of internal absolute filesystem paths."""
     msg = str(exc)
-    # Strip absolute Windows paths (e.g. C:\... or D:\...)
-    msg = re.sub(r"[A-Za-z]:\\[\w\s\-\\\.]+", "[REDACTED_PATH]", msg)
-    # Strip absolute POSIX paths
-    msg = re.sub(r"/(?:var|tmp|home|etc|usr|opt|root)/[\w\s\-/\.]+", "[REDACTED_PATH]", msg)
-    return f"{prefix}: {msg}"
+    # 1. Strip absolute Windows drive paths (supports C:\, D:/, \\?\C:\, Program Files (x86), @domain, etc.)
+    win_drive_pat = r"(?:\\\\\?\\)?[A-Za-z]:[\\/](?:[\w\-\.@\(\)\+~%]+(?: +[\w\-\.@\(\)\+~%]+)*[\\/])*[\w\-\.@\(\)\+~%]*"
+    msg = re.sub(win_drive_pat, "[REDACTED_PATH]", msg)
+    # 2. Strip UNC paths (e.g. \\server\share\...)
+    unc_pat = r"\\\\[\w\.\-]+[\\/](?:[\w\-\.@\(\)\+~%]+(?: +[\w\-\.@\(\)\+~%]+)*[\\/])*[\w\-\.@\(\)\+~%]*"
+    msg = re.sub(unc_pat, "[REDACTED_PATH]", msg)
+    # 3. Strip absolute POSIX paths (e.g. /var/..., /home/..., /app/...)
+    posix_pat = r"/(?:var|tmp|home|etc|usr|opt|root|app|srv|data)/[\w\-\./@\(\)\+~%]*"
+    msg = re.sub(posix_pat, "[REDACTED_PATH]", msg)
+    if prefix:
+        return f"{prefix}: {msg}"
+    return msg
+
+
+# Backward compatibility alias
+_sanitize_error_detail = sanitize_error_detail
 
 
 class CampaignExecutionRequest(BaseModel):

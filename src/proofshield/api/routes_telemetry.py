@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from fastapi import APIRouter, Body, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
+from proofshield.api.routes_campaigns import sanitize_error_detail
 from proofshield.normalisation.engine import NormalisationEngine
 from proofshield.schemas import (
     AlertV1,
@@ -201,7 +202,7 @@ def ingest_raw_telemetry(
                 for evt in event_list:
                     s.add_raw_event(evt)
         except (ValueError, sqlite3.Error) as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
+            raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Raw telemetry ingestion conflict"))
     return event_list
 
 
@@ -235,7 +236,7 @@ def normalize_telemetry(
     try:
         normalized = normalisation_engine.normalize_batch(event_list)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Normalisation failure: {str(exc)}")
+        raise HTTPException(status_code=400, detail=sanitize_error_detail(exc, prefix="Normalisation failure"))
 
     if store:
         s = get_store()
@@ -244,7 +245,7 @@ def normalize_telemetry(
                 for norm_evt in normalized:
                     s.add_normalized_event(norm_evt)
         except (ValueError, sqlite3.Error) as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
+            raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Normalized telemetry persistence conflict"))
 
     return normalized
 

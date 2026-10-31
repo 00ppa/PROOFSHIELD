@@ -521,7 +521,8 @@ class InMemoryStore:
             return [r.model_copy(deep=True) for r in sorted_reports]
 
 
-# Module-level singleton
+# Module-level singleton and initialization lock
+_store_lock = threading.Lock()
 _store_instance: Optional[StoreProtocol] = None
 
 
@@ -531,40 +532,45 @@ def get_store() -> StoreProtocol:
     Default backend: InMemoryStore.
     If configured for SQLite: SQLiteStore with configured path.
     Startup/configuration failures raise immediately and NEVER silently fall back.
+    Thread-safe double-checked locking prevents concurrent initialization races.
     """
     global _store_instance
     if _store_instance is None:
-        settings = get_settings()
-        if settings.storage_backend == StorageBackend.MEMORY:
-            _store_instance = InMemoryStore()
-        elif settings.storage_backend == StorageBackend.SQLITE:
-            from proofshield.services.sqlite_store import SQLiteStore
-            _store_instance = SQLiteStore(settings.sqlite_path)
+        with _store_lock:
+            if _store_instance is None:
+                settings = get_settings()
+                if settings.storage_backend == StorageBackend.MEMORY:
+                    _store_instance = InMemoryStore()
+                elif settings.storage_backend == StorageBackend.SQLITE:
+                    from proofshield.services.sqlite_store import SQLiteStore
+                    _store_instance = SQLiteStore(settings.sqlite_path)
     return _store_instance
 
 
 def set_store(store: Optional[StoreProtocol]) -> None:
     """Set or override the global store instance. Used for testing or custom lifecycles."""
     global _store_instance
-    if _store_instance is not None and _store_instance is not store:
-        if hasattr(_store_instance, "close"):
-            try:
-                _store_instance.close()
-            except Exception:
-                pass
-    _store_instance = store
+    with _store_lock:
+        if _store_instance is not None and _store_instance is not store:
+            if hasattr(_store_instance, "close"):
+                try:
+                    _store_instance.close()
+                except Exception:
+                    pass
+        _store_instance = store
 
 
 def close_store() -> None:
     """Close and clean up the active store instance if it supports close()."""
     global _store_instance
-    if _store_instance is not None:
-        if hasattr(_store_instance, "close"):
-            try:
-                _store_instance.close()
-            except Exception:
-                pass
-        _store_instance = None
+    with _store_lock:
+        if _store_instance is not None:
+            if hasattr(_store_instance, "close"):
+                try:
+                    _store_instance.close()
+                except Exception:
+                    pass
+            _store_instance = None
 
 
 def reset_store() -> None:

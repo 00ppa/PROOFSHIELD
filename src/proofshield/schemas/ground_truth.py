@@ -1,8 +1,8 @@
 """Ground truth labeling schemas."""
 
 from typing import Any, Dict, Literal, Optional
-from pydantic import Field
-from proofshield.schemas.common import DiagnosticCategory, ProofshieldBaseModel
+from pydantic import Field, field_validator
+from proofshield.schemas.common import DiagnosticCategory, ProofshieldBaseModel, validate_nesting_depth
 
 
 class GroundTruthV1(ProofshieldBaseModel):
@@ -49,3 +49,10 @@ class GroundTruthV1(ProofshieldBaseModel):
         default_factory=dict,
         description="Additional ground truth metadata",
     )
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_metadata_depth(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+        if v:
+            validate_nesting_depth(v, max_depth=16)
+        return v
