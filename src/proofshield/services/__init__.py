@@ -3,6 +3,13 @@ from proofshield.services.assurance_report import (
     compute_assurance_report_digest,
 )
 from proofshield.services.base_store import StoreProtocol
+from proofshield.services.elastic_orchestrator import (
+    ElasticAssuranceOrchestrator,
+    ElasticOrchestrationReport,
+    ElasticOrchestrator,
+    ElasticOrchestratorSettings,
+    NormalizationStatus,
+)
 from proofshield.services.evaluation import AssuranceEngine
 from proofshield.services.regression_analyzer import (
     CampaignRegressionAnalyzer,
@@ -16,7 +23,12 @@ __all__ = [
     "AssuranceEngine",
     "CampaignAssuranceReportGenerator",
     "CampaignRegressionAnalyzer",
+    "ElasticAssuranceOrchestrator",
+    "ElasticOrchestrationReport",
+    "ElasticOrchestrator",
+    "ElasticOrchestratorSettings",
     "InMemoryStore",
+    "NormalizationStatus",
     "RootCauseIntelligenceService",
     "SQLiteStore",
     "StoreProtocol",

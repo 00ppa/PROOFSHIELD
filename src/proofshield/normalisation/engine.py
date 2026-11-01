@@ -764,12 +764,16 @@ class NormalisationEngine:
     """Central engine that registers and invokes normalisers in priority order."""
 
     def __init__(self, normalisers: Optional[List[BaseNormaliser]] = None):
-        self.normalisers: List[BaseNormaliser] = normalisers or [
-            SysmonNormaliser(),
-            AuditdNormaliser(),
-            GenericEDRNormaliser(),
-            FallbackNormaliser(),
-        ]
+        if normalisers is None:
+            from proofshield.normalisation.ecs import ECSNormaliser
+            normalisers = [
+                SysmonNormaliser(),
+                AuditdNormaliser(),
+                GenericEDRNormaliser(),
+                ECSNormaliser(),
+                FallbackNormaliser(),
+            ]
+        self.normalisers: List[BaseNormaliser] = normalisers
 
     def normalize(self, raw_event: RawTelemetryEventV1) -> NormalizedTelemetryEventV1:
         """Normalize a single raw event through the first matching normaliser."""

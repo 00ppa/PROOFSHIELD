@@ -9,19 +9,25 @@ Provides:
 """
 
 from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 import json
 import os
 from pathlib import Path
+import re
 import ssl
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
+import time
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import urllib.error
 import urllib.request
+import uuid
 
 import dateutil.parser
 
 from proofshield.normalisation.engine import extract_execution_token
 from proofshield.schemas.alert import AlertV1
+from proofshield.schemas.telemetry import RawTelemetryEventV1
 from proofshield.services.base_store import StoreProtocol
 
 
@@ -31,6 +37,39 @@ class ElasticAlertMappingError(ValueError):
 
 class ElasticClientError(RuntimeError):
     """Raised on connection, query, timeout, or authentication failures with Elastic."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class TelemetryRetrievalStatus(str, Enum):
+    """Status classification for telemetry queries against Elasticsearch."""
+    COMPLETE = "COMPLETE"
+    TRUNCATED = "TRUNCATED"
+    EMPTY = "EMPTY"
+    FAILED = "FAILED"
+
+
+@dataclass
+class ElasticTelemetryHit:
+    """Strongly typed representation of an individual telemetry document hit."""
+    hit_id: str
+    index: str
+    source: Dict[str, Any]
+    timestamp: Optional[datetime] = None
+    sort_token: Optional[List[Any]] = None
+
+
+@dataclass
+class ElasticTelemetryBatch:
+    """Strongly typed batch response for telemetry retrieval queries."""
+    hits: List[Dict[str, Any]]
+    total_matched: Optional[int]
+    relation: str
+    is_truncated: bool
+    status: TelemetryRetrievalStatus
+    query_window: Tuple[Optional[datetime], Optional[datetime]] = (None, None)
 
 
 # Conservative Credential Redaction Policy:
@@ -483,6 +522,7 @@ class ElasticConnectorSettings:
         api_key: str,
         ca_cert_path: Optional[Union[str, Path]] = None,
         index_pattern: str = ".alerts-security.alerts-*",
+        telemetry_index_pattern: str = "logs-*",
         request_timeout: float = 10.0,
         max_results: int = 100,
         enabled: bool = False,
@@ -516,6 +556,11 @@ class ElasticConnectorSettings:
             raise ValueError("Elastic index pattern cannot be empty.")
         self.index_pattern = idx_clean
 
+        tel_idx_clean = str(telemetry_index_pattern).strip()
+        if not tel_idx_clean:
+            raise ValueError("Elastic telemetry index pattern cannot be empty.")
+        self.telemetry_index_pattern = tel_idx_clean
+
         try:
             t_val = float(request_timeout)
             if t_val <= 0:
@@ -545,6 +590,7 @@ class ElasticConnectorSettings:
         api_key = os.environ.get("PROOFSHIELD_ELASTIC_API_KEY", "")
         ca_cert = os.environ.get("PROOFSHIELD_ELASTIC_CA_CERT")
         index = os.environ.get("PROOFSHIELD_ELASTIC_INDEX", ".alerts-security.alerts-*")
+        telemetry_index = os.environ.get("PROOFSHIELD_ELASTIC_TELEMETRY_INDEX", "logs-*")
         timeout_env = os.environ.get("PROOFSHIELD_ELASTIC_TIMEOUT", "10.0")
         max_env = os.environ.get("PROOFSHIELD_ELASTIC_MAX_RESULTS", "100")
         enabled_env = os.environ.get("PROOFSHIELD_ELASTIC_ENABLED", "false").strip().lower()
@@ -556,6 +602,7 @@ class ElasticConnectorSettings:
             api_key=api_key,
             ca_cert_path=ca_cert,
             index_pattern=index,
+            telemetry_index_pattern=telemetry_index,
             request_timeout=float(timeout_env),
             max_results=int(max_env),
             enabled=enabled,
@@ -567,6 +614,7 @@ class ElasticConnectorSettings:
             f"ElasticConnectorSettings(base_url={self.base_url!r}, "
             f"api_key='***REDACTED***', "
             f"index_pattern={self.index_pattern!r}, "
+            f"telemetry_index_pattern={self.telemetry_index_pattern!r}, "
             f"request_timeout={self.request_timeout}, "
             f"max_results={self.max_results}, "
             f"enabled={self.enabled})"
@@ -661,6 +709,69 @@ class ElasticAlertClient:
             self._ssl_context: Optional[ssl.SSLContext] = ctx
         else:
             self._ssl_context = None
+
+    def _post_search(
+        self,
+        endpoint_url: str,
+        query_dsl: Dict[str, Any],
+        max_retries: int = 2,
+    ) -> Dict[str, Any]:
+        """Execute POST search against Elasticsearch with retry on transient status codes."""
+        payload_bytes = json.dumps(query_dsl).encode("utf-8")
+        req = urllib.request.Request(
+            url=endpoint_url,
+            data=payload_bytes,
+            headers={
+                "Authorization": f"ApiKey {self.settings.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "ProofShield-Elastic-Connector/0.1.0",
+            },
+            method="POST",
+        )
+
+        attempt = 0
+        while True:
+            try:
+                with urllib.request.urlopen(
+                    req,
+                    timeout=self.settings.request_timeout,
+                    context=self._ssl_context,
+                ) as resp:
+                    resp_data = resp.read().decode("utf-8")
+                    return json.loads(resp_data)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (429, 502, 503, 504) and attempt < max_retries:
+                    attempt += 1
+                    time.sleep(0.05 * (2 ** (attempt - 1)))
+                    continue
+                diag = _extract_http_diagnostic(exc, redacted_secret=self.settings.api_key)
+                err_detail = f"HTTP {exc.code} ({exc.reason})"
+                if diag:
+                    err_detail += f": {diag}"
+                raise ElasticClientError(
+                    f"Elasticsearch search failed with {err_detail}",
+                    status_code=exc.code,
+                ) from exc
+            except (TimeoutError, urllib.error.URLError) as exc:
+                is_timeout = isinstance(exc, TimeoutError) or "timed out" in str(getattr(exc, "reason", "")).lower()
+                if is_timeout and attempt < max_retries:
+                    attempt += 1
+                    time.sleep(0.05 * (2 ** (attempt - 1)))
+                    continue
+                if isinstance(exc, TimeoutError):
+                    raise ElasticClientError(
+                        f"Elasticsearch request timed out after {self.settings.request_timeout}s"
+                    ) from exc
+                raise ElasticClientError(
+                    f"Elasticsearch connection failed: {exc.reason}"
+                ) from exc
+            except ElasticClientError:
+                raise
+            except Exception as exc:
+                raise ElasticClientError(
+                    f"Unexpected error querying Elasticsearch: {exc}"
+                ) from exc
 
     def search_alerts(
         self,
@@ -768,87 +879,44 @@ class ElasticAlertClient:
             if search_after:
                 query_dsl["search_after"] = search_after
 
-            payload_bytes = json.dumps(query_dsl).encode("utf-8")
-            req = urllib.request.Request(
-                url=endpoint_url,
-                data=payload_bytes,
-                headers={
-                    "Authorization": f"ApiKey {self.settings.api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "User-Agent": "ProofShield-Elastic-Connector/0.1.0",
-                },
-                method="POST",
-            )
+            body = self._post_search(endpoint_url, query_dsl, max_retries=2)
+            hits_container = body.get("hits", {})
+            page_hits = hits_container.get("hits", [])
 
-            try:
-                with urllib.request.urlopen(
-                    req,
-                    timeout=self.settings.request_timeout,
-                    context=self._ssl_context,
-                ) as resp:
-                    resp_data = resp.read().decode("utf-8")
-                    body = json.loads(resp_data)
-                    hits_container = body.get("hits", {})
-                    page_hits = hits_container.get("hits", [])
+            # Parse hits.total (supports integer or {value: int, relation: str})
+            if self.last_search_total is None:
+                total_raw = hits_container.get("total")
+                if isinstance(total_raw, dict):
+                    self.last_search_total = int(total_raw.get("value", 0))
+                    self.last_search_relation = str(total_raw.get("relation", "eq")).strip().lower()
+                elif isinstance(total_raw, (int, float)):
+                    self.last_search_total = int(total_raw)
+                    self.last_search_relation = "eq"
+                else:
+                    self.last_search_total = len(page_hits)
+                    self.last_search_relation = "eq"
 
-                    # Parse hits.total (supports integer or {value: int, relation: str})
-                    if self.last_search_total is None:
-                        total_raw = hits_container.get("total")
-                        if isinstance(total_raw, dict):
-                            self.last_search_total = int(total_raw.get("value", 0))
-                            self.last_search_relation = str(total_raw.get("relation", "eq")).strip().lower()
-                        elif isinstance(total_raw, (int, float)):
-                            self.last_search_total = int(total_raw)
-                            self.last_search_relation = "eq"
-                        else:
-                            self.last_search_total = len(page_hits)
-                            self.last_search_relation = "eq"
+            if not page_hits:
+                break
 
-                    if not page_hits:
-                        break
+            all_hits.extend(page_hits)
 
-                    all_hits.extend(page_hits)
+            if len(all_hits) >= effective_limit or len(page_hits) < page_size:
+                break
 
-                    if len(all_hits) >= effective_limit or len(page_hits) < page_size:
-                        break
-
-                    # Prepare search_after token from the last hit in the current page
-                    last_hit = page_hits[-1]
-                    sort_val = last_hit.get("sort")
-                    if isinstance(sort_val, (list, tuple)) and len(sort_val) >= 1:
-                        search_after = list(sort_val)
-                    else:
-                        # Missing sort token prevents reliable continuation
-                        self.last_search_truncated = True
-                        if raise_on_truncation:
-                            raise ElasticClientError(
-                                "Elasticsearch search hit missing valid 'sort' values required for search_after pagination"
-                            )
-                        break
-
-            except urllib.error.HTTPError as exc:
-                diag = _extract_http_diagnostic(exc, redacted_secret=self.settings.api_key)
-                err_detail = f"HTTP {exc.code} ({exc.reason})"
-                if diag:
-                    err_detail += f": {diag}"
-                raise ElasticClientError(
-                    f"Elasticsearch search failed with {err_detail}"
-                ) from exc
-            except urllib.error.URLError as exc:
-                raise ElasticClientError(
-                    f"Elasticsearch connection failed: {exc.reason}"
-                ) from exc
-            except TimeoutError as exc:
-                raise ElasticClientError(
-                    f"Elasticsearch request timed out after {self.settings.request_timeout}s"
-                ) from exc
-            except ElasticClientError:
-                raise
-            except Exception as exc:
-                raise ElasticClientError(
-                    f"Unexpected error querying Elasticsearch: {exc}"
-                ) from exc
+            # Prepare search_after token from the last hit in the current page
+            last_hit = page_hits[-1]
+            sort_val = last_hit.get("sort")
+            if isinstance(sort_val, (list, tuple)) and len(sort_val) >= 1:
+                search_after = list(sort_val)
+            else:
+                # Missing sort token prevents reliable continuation
+                self.last_search_truncated = True
+                if raise_on_truncation:
+                    raise ElasticClientError(
+                        "Elasticsearch search hit missing valid 'sort' values required for search_after pagination"
+                    )
+                break
 
         # Conservative truncation detection:
         # 1. Total count exceeds the number of retrieved hits
@@ -933,18 +1001,19 @@ class ElasticAlertClient:
         Returns:
             List of newly ingested AlertV1 instances.
         """
-        def _execute_ingestion() -> List[AlertV1]:
-            alerts = self.fetch_and_map_alerts(
-                start_time=start_time,
-                end_time=end_time,
-                rule_ids=rule_ids,
-                host=host,
-                limit=limit,
-                deduplicate=True,
-                raise_on_truncation=raise_on_truncation,
-                batch_size=batch_size,
-            )
+        # Decouple network retrieval from store transactions
+        alerts = self.fetch_and_map_alerts(
+            start_time=start_time,
+            end_time=end_time,
+            rule_ids=rule_ids,
+            host=host,
+            limit=limit,
+            deduplicate=True,
+            raise_on_truncation=raise_on_truncation,
+            batch_size=batch_size,
+        )
 
+        def _execute_ingestion() -> List[AlertV1]:
             ingested: List[AlertV1] = []
             duplicate_ids: List[str] = []
 
@@ -976,4 +1045,301 @@ class ElasticAlertClient:
             with store.transaction():
                 return _execute_ingestion()
         return _execute_ingestion()
+
+    def search_telemetry(
+        self,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        host: Optional[str] = None,
+        process_name: Optional[str] = None,
+        query_string: Optional[str] = None,
+        limit: Optional[int] = None,
+        raise_on_truncation: bool = False,
+        batch_size: Optional[int] = None,
+        max_retries: int = 2,
+    ) -> ElasticTelemetryBatch:
+        """Query Elasticsearch for raw telemetry documents within a bounded window.
+
+        Queries the configured telemetry index pattern (e.g. 'logs-*').
+        Supports search_after pagination, host/process/query filters,
+        and strict truncation detection.
+
+        Args:
+            start_time: Earliest event timestamp (inclusive).
+            end_time: Latest event timestamp (inclusive).
+            host: Optional host/endpoint identifier filter.
+            process_name: Optional process name/executable filter.
+            query_string: Optional Lucene query string.
+            limit: Maximum events to return (capped by settings.max_results).
+            raise_on_truncation: If True, raises ElasticClientError on truncated results.
+            batch_size: Page size chunk for pagination queries.
+            max_retries: Number of retries on transient errors (429, 502, 503, 504, timeout).
+
+        Returns:
+            ElasticTelemetryBatch with hits, count, and truncation status.
+        """
+        filters: List[Dict[str, Any]] = []
+
+        range_filter: Dict[str, Any] = {}
+        if start_time is not None:
+            st = start_time.astimezone(timezone.utc) if start_time.tzinfo else start_time.replace(tzinfo=timezone.utc)
+            range_filter["gte"] = st.isoformat()
+        if end_time is not None:
+            et = end_time.astimezone(timezone.utc) if end_time.tzinfo else end_time.replace(tzinfo=timezone.utc)
+            range_filter["lte"] = et.isoformat()
+
+        if range_filter:
+            filters.append({"range": {"@timestamp": range_filter}})
+
+        if host and host.strip():
+            h = host.strip()
+            filters.append(
+                {
+                    "bool": {
+                        "should": [
+                            {"term": {"host.hostname": h}},
+                            {"term": {"host.name": h}},
+                            {"term": {"host.id": h}},
+                            {"term": {"agent.hostname": h}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                }
+            )
+
+        if process_name and process_name.strip():
+            p = process_name.strip()
+            filters.append(
+                {
+                    "bool": {
+                        "should": [
+                            {"term": {"process.name": p}},
+                            {"term": {"process.executable": p}},
+                            {"wildcard": {"process.command_line": f"*{p}*"}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                }
+            )
+
+        if query_string and query_string.strip():
+            filters.append({"query_string": {"query": query_string.strip()}})
+
+        effective_limit = min(limit or self.settings.max_results, self.settings.max_results)
+        endpoint_url = f"{self.settings.base_url}/{self.settings.telemetry_index_pattern}/_search"
+
+        all_hits: List[Dict[str, Any]] = []
+        search_after: Optional[List[Any]] = None
+        total_matched: Optional[int] = None
+        relation: str = "eq"
+        is_truncated: bool = False
+        page_chunk = batch_size if (batch_size is not None and batch_size > 0) else 100
+        page_hits: List[Dict[str, Any]] = []
+        page_size = page_chunk
+
+        while len(all_hits) < effective_limit:
+            page_size = min(effective_limit - len(all_hits), page_chunk)
+            query_dsl: Dict[str, Any] = {
+                "query": {"bool": {"filter": filters} if filters else {"match_all": {}}},
+                "sort": [
+                    {"@timestamp": {"order": "asc"}},
+                    {"_id": {"order": "asc"}},
+                ],
+                "size": page_size,
+            }
+            if search_after:
+                query_dsl["search_after"] = search_after
+
+            body = self._post_search(endpoint_url, query_dsl, max_retries=max_retries)
+            hits_container = body.get("hits", {})
+            page_hits = hits_container.get("hits", [])
+
+            if total_matched is None:
+                total_raw = hits_container.get("total")
+                if isinstance(total_raw, dict):
+                    total_matched = int(total_raw.get("value", 0))
+                    relation = str(total_raw.get("relation", "eq")).strip().lower()
+                elif isinstance(total_raw, (int, float)):
+                    total_matched = int(total_raw)
+                    relation = "eq"
+                else:
+                    total_matched = len(page_hits)
+                    relation = "eq"
+
+            if not page_hits:
+                break
+
+            all_hits.extend(page_hits)
+
+            if len(all_hits) >= effective_limit or len(page_hits) < page_size:
+                break
+
+            last_hit = page_hits[-1]
+            sort_val = last_hit.get("sort")
+            if isinstance(sort_val, (list, tuple)) and len(sort_val) >= 1:
+                search_after = list(sort_val)
+            else:
+                is_truncated = True
+                if raise_on_truncation:
+                    raise ElasticClientError(
+                        "Elasticsearch search hit missing valid 'sort' values required for search_after pagination"
+                    )
+                break
+
+        # Check truncation
+        if total_matched is not None and total_matched > len(all_hits):
+            is_truncated = True
+        elif relation == "gte" and (len(all_hits) >= effective_limit or (page_hits and len(page_hits) == page_size)):
+            is_truncated = True
+
+        if is_truncated and raise_on_truncation:
+            rel_str = f" (relation '{relation}')" if relation != "eq" else ""
+            raise ElasticClientError(
+                f"Elasticsearch telemetry search results truncated: matched {total_matched}{rel_str} events "
+                f"but query limit bounded to {len(all_hits)}"
+            )
+
+        if not all_hits:
+            status = TelemetryRetrievalStatus.EMPTY
+        elif is_truncated:
+            status = TelemetryRetrievalStatus.TRUNCATED
+        else:
+            status = TelemetryRetrievalStatus.COMPLETE
+
+        return ElasticTelemetryBatch(
+            hits=all_hits,
+            total_matched=total_matched,
+            relation=relation,
+            is_truncated=is_truncated,
+            status=status,
+            query_window=(start_time, end_time),
+        )
+
+    @staticmethod
+    def map_hits_to_raw_telemetry(hits: Iterable[Dict[str, Any]]) -> List[RawTelemetryEventV1]:
+        """Convert raw Elastic hits to canonical RawTelemetryEventV1 models."""
+        raw_events: List[RawTelemetryEventV1] = []
+        for hit in hits:
+            source = hit.get("_source", hit)
+            hit_id = str(hit.get("_id") or _get_nested(source, "_id") or _get_nested(source, "event.id") or uuid.uuid4().hex[:12]).strip()
+            raw_event_id = f"elastic:raw:{hit_id}" if not hit_id.startswith("elastic:") else hit_id
+
+            ts_raw = _get_nested(source, "@timestamp") or _get_nested(source, "event.created")
+            try:
+                source_ts = _parse_timestamp(ts_raw) if ts_raw else None
+            except Exception:
+                source_ts = None
+            if source_ts is None:
+                source_ts = datetime.now(timezone.utc)
+
+            sanitized_payload = _sanitize_metadata(deepcopy(source))
+
+            raw_events.append(
+                RawTelemetryEventV1(
+                    schema_version="v1",
+                    raw_event_id=raw_event_id,
+                    source_event_id=hit_id,
+                    source_format="elastic_ecs",
+                    source_timestamp=source_ts,
+                    ingested_at=datetime.now(timezone.utc),
+                    raw_payload=sanitized_payload,
+                )
+            )
+        return raw_events
+
+    def fetch_raw_telemetry(
+        self,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        host: Optional[str] = None,
+        process_name: Optional[str] = None,
+        query_string: Optional[str] = None,
+        limit: Optional[int] = None,
+        raise_on_truncation: bool = False,
+        batch_size: Optional[int] = None,
+        max_retries: int = 2,
+    ) -> List[RawTelemetryEventV1]:
+        """Fetch telemetry documents from Elastic and map them into RawTelemetryEventV1 models."""
+        batch = self.search_telemetry(
+            start_time=start_time,
+            end_time=end_time,
+            host=host,
+            process_name=process_name,
+            query_string=query_string,
+            limit=limit,
+            raise_on_truncation=raise_on_truncation,
+            batch_size=batch_size,
+            max_retries=max_retries,
+        )
+        return self.map_hits_to_raw_telemetry(batch.hits)
+
+    def poll_and_ingest_telemetry(
+        self,
+        store: StoreProtocol,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        host: Optional[str] = None,
+        process_name: Optional[str] = None,
+        query_string: Optional[str] = None,
+        limit: Optional[int] = None,
+        skip_duplicates: bool = True,
+        raise_on_truncation: bool = False,
+        batch_size: Optional[int] = None,
+        atomic: bool = False,
+        max_retries: int = 2,
+    ) -> List[RawTelemetryEventV1]:
+        """Fetch telemetry and ingest raw events into a ProofShield store idempotently.
+
+        Guarantees:
+        - When atomic=True: the ingestion sequence is executed inside store.transaction().
+        - When skip_duplicates=True: existing raw events are skipped idempotently.
+        - When skip_duplicates=False: raises ValueError listing duplicate IDs.
+        """
+        # Decouple network retrieval from store transactions
+        raw_events = self.fetch_raw_telemetry(
+            start_time=start_time,
+            end_time=end_time,
+            host=host,
+            process_name=process_name,
+            query_string=query_string,
+            limit=limit,
+            raise_on_truncation=raise_on_truncation,
+            batch_size=batch_size,
+            max_retries=max_retries,
+        )
+
+        def _execute_ingestion() -> List[RawTelemetryEventV1]:
+            ingested: List[RawTelemetryEventV1] = []
+            duplicate_ids: List[str] = []
+
+            for rev in raw_events:
+                existing = store.get_raw_event(rev.raw_event_id)
+                if existing is not None:
+                    duplicate_ids.append(rev.raw_event_id)
+                    continue
+
+                try:
+                    store.add_raw_event(rev)
+                    ingested.append(rev)
+                except ValueError as exc:
+                    if "already exists" in str(exc).lower():
+                        duplicate_ids.append(rev.raw_event_id)
+                    else:
+                        raise
+
+            if not skip_duplicates and duplicate_ids:
+                raise ValueError(
+                    f"Duplicate raw event(s) already exist in store: {', '.join(duplicate_ids)}"
+                )
+
+            return ingested
+
+        if atomic:
+            with store.transaction():
+                return _execute_ingestion()
+        return _execute_ingestion()
+
+
+# Backwards compatibility alias
+ElasticClient = ElasticAlertClient
 

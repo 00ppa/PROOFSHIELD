@@ -220,12 +220,18 @@ def normalize_telemetry(
         False,
         description="Persist normalized events to store if True (default: False)",
     ),
+    store_raw: bool = Query(
+        False,
+        description="Also persist original raw telemetry events to store if True (default: False)",
+    ),
 ) -> List[NormalizedTelemetryEventV1]:
     """Convert raw telemetry events to canonical NormalizedTelemetryEventV1 records.
 
     Preserves source event identifiers and original source timestamps.
     If store=True, normalized events are persisted to the active entity store.
-    Raises HTTP 409 if any normalized event has a duplicate identifier.
+    If store_raw=True, input raw events are persisted to the active entity store.
+    If both store=True and store_raw=True, both raw and normalized events are persisted atomically.
+    Raises HTTP 409 if any event has a duplicate identifier.
     """
     event_list = [events] if isinstance(events, RawTelemetryEventV1) else events
     if len(event_list) > MAX_BATCH_RECORDS:
@@ -238,16 +244,57 @@ def normalize_telemetry(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=sanitize_error_detail(exc, prefix="Normalisation failure"))
 
+    if store or store_raw:
+        s = get_store()
+        try:
+            with s.transaction():
+                if store_raw:
+                    for raw_evt in event_list:
+                        s.add_raw_event(raw_evt)
+                if store:
+                    for norm_evt in normalized:
+                        s.add_normalized_event(norm_evt)
+        except (ValueError, sqlite3.Error) as exc:
+            raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Telemetry persistence conflict"))
+
+    return normalized
+
+
+@router.post(
+    "/telemetry/normalized",
+    response_model=List[NormalizedTelemetryEventV1],
+    summary="Validate and ingest normalized telemetry events",
+)
+def ingest_normalized_telemetry(
+    events: Union[NormalizedTelemetryEventV1, List[NormalizedTelemetryEventV1]] = Body(
+        ...,
+        description="Single normalized telemetry event or batch of events",
+    ),
+    store: bool = Query(
+        False,
+        description="Persist validated events to store if True (default: False)",
+    ),
+) -> List[NormalizedTelemetryEventV1]:
+    """Validate one or more normalized telemetry events against NormalizedTelemetryEventV1.
+
+    If store=True, validated events are persisted to the active entity store.
+    Raises HTTP 409 if any event has a duplicate identifier.
+    """
+    event_list = [events] if isinstance(events, NormalizedTelemetryEventV1) else events
+    if len(event_list) > MAX_BATCH_RECORDS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Batch size exceeds maximum limit of {MAX_BATCH_RECORDS} events (received {len(event_list)}).",
+        )
     if store:
         s = get_store()
         try:
             with s.transaction():
-                for norm_evt in normalized:
-                    s.add_normalized_event(norm_evt)
+                for evt in event_list:
+                    s.add_normalized_event(evt)
         except (ValueError, sqlite3.Error) as exc:
-            raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Normalized telemetry persistence conflict"))
-
-    return normalized
+            raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Normalized telemetry ingestion conflict"))
+    return event_list
 
 
 @router.post(

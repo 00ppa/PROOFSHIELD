@@ -3,8 +3,12 @@
 from proofshield.connectors.elastic import (
     ElasticAlertClient,
     ElasticAlertMappingError,
+    ElasticClient,
     ElasticClientError,
     ElasticConnectorSettings,
+    ElasticTelemetryBatch,
+    ElasticTelemetryHit,
+    TelemetryRetrievalStatus,
     map_elastic_alert,
     map_elastic_alerts_batch,
 )
@@ -12,8 +16,12 @@ from proofshield.connectors.elastic import (
 __all__ = [
     "ElasticAlertClient",
     "ElasticAlertMappingError",
+    "ElasticClient",
     "ElasticClientError",
     "ElasticConnectorSettings",
+    "ElasticTelemetryBatch",
+    "ElasticTelemetryHit",
+    "TelemetryRetrievalStatus",
     "map_elastic_alert",
     "map_elastic_alerts_batch",
 ]
