@@ -45,6 +45,7 @@ def scenario_with_rule(store):
         validation_target=ValidationTarget.EXPECTED_ALERT,
     )
     store.add_scenario(scn)
+    store.add_rule(DetectionRuleV1(rule_id="RULE-SIGMA-001", rule_name="PowerShell test rule", rule_format="sigma"))
     return scn
 
 
@@ -654,10 +655,11 @@ def test_missing_alert_timestamp_preserves_ingestion_metadata_only(store, engine
     )
     store.add_alert(alert)
 
-    # Ingestion time must be set as ingestion metadata, not alert_timestamp
-    assert alert.ingested_at is not None
-    assert alert.alert_timestamp is None
-    assert alert.metadata.get("ingestion_time_only") is True
+    # Ingestion time must be set on the stored copy as metadata, not alert_timestamp
+    stored_alert = store.get_alert("ALT-INGESTION-ONLY")
+    assert stored_alert.ingested_at is not None
+    assert stored_alert.alert_timestamp is None
+    assert stored_alert.metadata.get("ingestion_time_only") is True
 
     # Evaluation cannot verify whether detection occurred during run window -> INCONCLUSIVE
     res = engine.evaluate_run(completed_run.run_id)

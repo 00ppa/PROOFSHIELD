@@ -299,8 +299,10 @@ def evaluate_test_run(
     store = get_store()
     engine = AssuranceEngine(store)
     try:
-        result = engine.evaluate_run(run_id, strict_attribution=strict_attribution)
-        store.add_result(result)
+        from proofshield.services.evidence_snapshot import persist_diagnosis
+        with store.transaction():
+            result = engine.evaluate_run(run_id, strict_attribution=strict_attribution)
+            persist_diagnosis(store, result)
         return result
     except (ValueError, sqlite3.Error) as exc:
         raise HTTPException(status_code=409, detail=sanitize_error_detail(exc, prefix="Evaluation failed"))

@@ -194,6 +194,33 @@ def _is_before_window(ts: Optional[datetime], w_start: datetime) -> bool:
     return ts < w_start
 
 
+def _timestamp_in_optional_window(
+    ts: Optional[datetime],
+    window_start: Optional[datetime],
+    window_end: Optional[datetime],
+) -> bool:
+    """Apply store-compatible timestamp bounds to an already-fetched alert."""
+    if ts is None:
+        return False
+    if window_start is not None:
+        start = window_start
+        if ts.tzinfo is not None and start.tzinfo is None:
+            start = start.replace(tzinfo=ts.tzinfo)
+        elif ts.tzinfo is None and start.tzinfo is not None:
+            ts = ts.replace(tzinfo=start.tzinfo)
+        if ts < start:
+            return False
+    if window_end is not None:
+        end = window_end
+        if ts.tzinfo is not None and end.tzinfo is None:
+            end = end.replace(tzinfo=ts.tzinfo)
+        elif ts.tzinfo is None and end.tzinfo is not None:
+            ts = ts.replace(tzinfo=end.tzinfo)
+        if ts > end:
+            return False
+    return True
+
+
 class AssuranceEngine:
     """Deterministic diagnostic engine (Architecture Layer 5).
 
@@ -221,7 +248,8 @@ class AssuranceEngine:
         self.strict_attribution = strict_attribution
 
     def evaluate_run(
-        self, run_id: str, strict_attribution: Optional[bool] = None
+        self, run_id: str, strict_attribution: Optional[bool] = None,
+        collection_report: Optional[Dict[str, Any]] = None,
     ) -> DiagnosticResultV1:
         """Evaluate a test run and produce a diagnostic result.
 
@@ -248,6 +276,16 @@ class AssuranceEngine:
                 scenario_id=run.scenario_id,
                 reason=f"Scenario not found: {run.scenario_id}",
             )
+
+        previous = self.store.get_result_for_run(run_id)
+        collection = collection_report if collection_report is not None else (
+            previous.metadata.get("collection") if previous else None
+        )
+        if collection is not None and not collection.get("is_complete", False):
+            result = self._error_result(run_id=run_id, scenario_id=run.scenario_id,
+                reason="Evidence collection is incomplete; successful recollection is required before evaluation")
+            result.metadata["collection"] = collection
+            return result
 
         # Resolve strict attribution setting: parameter overrides run.metadata overrides engine default
         if strict_attribution is not None:
@@ -485,7 +523,9 @@ class AssuranceEngine:
                     )
 
         # ── Step 2: Correlate events to the run ──────────────────────────
-        events = self.store.get_events_for_run(run)
+        # Evaluation is read-only; stores retain their default deep-copy API for
+        # callers, while this internal path avoids copying every evidence model.
+        events = self.store.get_events_for_run(run, copy=False)
 
         if not events:
             return self._make_result(
@@ -749,6 +789,33 @@ class AssuranceEngine:
 
         rule_id = scenario.expected_detection_rule_id
 
+        if self.store.get_rule(rule_id) is None:
+            return self._make_result(
+                run=run,
+                scenario=scenario,
+                category=DiagnosticCategory.INCONCLUSIVE,
+                reason=(
+                    f"Expected detection rule '{rule_id}' is not registered; "
+                    "detection outcome cannot be evaluated"
+                ),
+                confidence="uncertain",
+                supporting_evidence=matched_evidence_ids,
+                metadata={
+                    "attribution": self._build_attribution_metadata(
+                        run_token=run_token,
+                        status=AttributionStatus.INCONCLUSIVE.value if is_strict else AttributionStatus.NOT_REQUESTED.value,
+                        is_strict=is_strict,
+                        events=matching_events,
+                        notes=["Expected detection rule is missing from the store"],
+                    ),
+                    "missing_detection_rule": True,
+                },
+                diagnostic_reasons=[
+                    f"Expected rule: {rule_id}",
+                    "Rule registration is required before detection evidence can establish a verdict",
+                ],
+            )
+
         # Determine configurable alert search window with grace period
         grace_seconds = self.default_alert_grace_period_seconds
         if run.metadata and "alert_grace_period_seconds" in run.metadata:
@@ -762,9 +829,14 @@ class AssuranceEngine:
         search_end = run.window_end + grace
 
         # Query alerts across the monitoring system for this rule within search window (including grace period)
-        all_rule_alerts = self.store.list_alerts_for_rule(
-            rule_id, window_start=search_start, window_end=search_end
-        )
+        # Fetch the rule's alerts once. The unbounded collection is also needed
+        # below for untimestamped candidates; filtering locally avoids a second
+        # full scan and repeated model copies.
+        rule_alerts = self.store.list_alerts_for_rule(rule_id, copy=False)
+        all_rule_alerts = [
+            alert for alert in rule_alerts
+            if _timestamp_in_optional_window(alert.alert_timestamp, search_start, search_end)
+        ]
 
         # Check candidate alerts on target host lacking timestamps within defensible scope:
         # 1. Alert must reference this detection rule and match target host.
@@ -778,7 +850,7 @@ class AssuranceEngine:
         #    Completely undated alerts (lacking both event timestamp and ingestion time) are not
         #    silently treated as current unless explicitly bearing the run's execution token.
         missing_ts_candidate_alerts = []
-        for a in self.store.list_alerts_for_rule(rule_id):
+        for a in rule_alerts:
             if a.alert_timestamp is not None:
                 continue
             if not hosts_match(run.target_host, a.host_id):
@@ -847,7 +919,7 @@ class AssuranceEngine:
                     res_meta["latency"] = latency_meta
 
                 if not all_rule_alerts:
-                    all_alerts_in_window = self.store.get_alerts_for_run(run)
+                    all_alerts_in_window = self.store.get_alerts_for_run(run, copy=False)
                     diagnostic_reasons = [
                         f"Expected rule: {rule_id}",
                         f"Telemetry was present ({len(matching_events)} matched event(s))",

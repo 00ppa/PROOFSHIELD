@@ -16,6 +16,12 @@ def test_client() -> TestClient:
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def explicit_local_api_auth_opt_in(monkeypatch: pytest.MonkeyPatch):
+    """Keep legacy local TestClient coverage explicit after API auth hardening."""
+    monkeypatch.setenv("PROOFSHIELD_ALLOW_LOCAL_UNAUTHENTICATED", "true")
+
+
 @pytest.fixture
 def fixtures_dir() -> Path:
     """Path to the fixtures directory."""
@@ -65,4 +71,3 @@ def alerts_jsonl_path(fixtures_dir: Path) -> Path:
 @pytest.fixture
 def ground_truth_jsonl_path(fixtures_dir: Path) -> Path:
     return fixtures_dir / "ground_truth_v1.jsonl"
-

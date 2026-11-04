@@ -1570,6 +1570,7 @@ def test_benchmark_causal_confounding_unrelated_alert_limitation():
         execution_status=ExecutionStatus.COMPLETED,
     )
     store.add_scenario(scn)
+    store.add_rule(DetectionRuleV1(rule_id="RULE-SIGMA-CRADLE-01", rule_name="Causal audit rule", rule_format="sigma"))
     store.add_run(run)
 
     # Ingest attack telemetry for this run
@@ -1783,6 +1784,8 @@ def test_benchmark_leakage_safeguard():
 
     case = suite[0]  # BM-01
     store.add_scenario(case.scenario)
+    for rule in case.rules:
+        store.add_rule(rule)
     store.add_run(case.run)
     for raw in case.raw_events:
         store.add_raw_event(raw)

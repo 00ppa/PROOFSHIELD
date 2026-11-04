@@ -4,7 +4,7 @@
 
 - **Author & Maintainer**: FS ([@00ppa](https://github.com/00ppa))
 - **Status**: Research Prototype (v0.1.0)
-- **Test Suite**: 499/499 passing automated tests across 33 modules (6s runtime)
+- **Test Suite**: 628 passing automated tests, 2 optional skips (Python 3.12)
 - **Benchmark**: 25 controlled benchmark scenarios (BM-01 to BM-25) + 12-case fault matrix (FT-01 to FT-12)
 - **Architecture Specification**: Detailed specifications in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
@@ -49,6 +49,12 @@
    - **`CampaignRegressionAnalyzer`**: Evaluates comparability (detecting disjoint scenarios, configuration drift, and engine drift), identifies regressions vs improvements with explicit severities and actionability, and deterministically resolves comparative verdicts (`REGRESSION`, `IMPROVEMENT`, `NO_CHANGE`, `INSUFFICIENT_DATA`, `INCOMPARABLE`).
    - **`RootCauseIntelligenceService`**: Aggregates failure patterns while strictly separating empirically observed facts from plausible inferred explanations.
    - **Full Dual-Backend Persistence & REST API**: Extends both `InMemoryStore` and `SQLiteStore` with `campaign_assurance_reports` table, and exposes versioned `/api/v1` endpoints for report compilation, retrieval, regression comparison, and root-cause intelligence.
+
+10. **Controlled execution and SIEM integrations (Phases 20–21)**:
+    - Approved benign endpoint actions with execution evidence, strict authentication, cancellation, integrity hashes, and Elastic/Splunk retrieval orchestration.
+
+11. **Research and analyst layers (Phases 22–24)**:
+    - Provenance-aware dataset collection, deterministic local ML baselines, evidence-grounded explanations, integrity-verifiable reports, CSV export, optional API authentication, and a connected analyst console at `/ui`.
 
 ---
 
@@ -172,7 +178,15 @@ PROOFSHIELD/
 │       │   ├── routes_campaigns.py     # Campaign CRUD, execution, replay, report & comparison routes
 │       │   ├── routes_evaluation.py    # Diagnostic evaluation & entity CRUD routes
 │       │   ├── routes_health.py        # Health probe endpoints
-│       │   └── routes_telemetry.py     # Ingestion & normalisation routes
+│       │   ├── routes_telemetry.py     # Ingestion & normalisation routes
+│       │   ├── routes_splunk.py         # Splunk assurance routes
+│       │   ├── routes_reports.py        # Evidence report and CSV export routes
+│       │   └── routes_ui.py             # Connected analyst console
+│       ├── connectors/                  # External telemetry source clients
+│       │   ├── elastic.py               # Elasticsearch connector
+│       │   └── splunk.py                # Splunk REST export connector
+│       ├── execution/                   # Approved endpoint execution subsystem
+│       ├── research/                    # Provenance-aware dataset and ML baselines
 │       ├── normalisation/              # Layer 3 Telemetry normalisation
 │       │   ├── base.py                 # BaseNormaliser abstract contract
 │       │   └── engine.py               # Sysmon, Generic EDR, Fallback normalisers & token extraction
@@ -185,7 +199,10 @@ PROOFSHIELD/
 │       │   ├── ground_truth.py         # GroundTruthV1 schema
 │       │   ├── scenario.py             # ScenarioV1 schema
 │       │   ├── telemetry.py            # RawTelemetryEventV1 & NormalizedTelemetryEventV1
-│       │   └── test_run.py             # TestRunV1 schema
+│       │   ├── test_run.py             # TestRunV1 schema
+│       │   ├── explanation.py          # Analyst explanation schema
+│       │   ├── report.py               # Run evidence report schema
+│       │   └── research.py             # Dataset and model result schemas
 │       ├── services/                   # Layer 5 Assurance Engine & Layer 2 Storage
 │       │   ├── base_store.py           # StoreProtocol definition including campaign interfaces
 │       │   ├── campaign_comparison.py  # Deterministic campaign run regression & diff engine
@@ -196,7 +213,7 @@ PROOFSHIELD/
 │       │   └── store.py                # Layer 2 In-memory entity store & correlation engine
 │       └── storage/                    # Layer 2 Streaming JSONL
 │           └── jsonl_loader.py         # Streaming JSONL reader & schema validator
-├── tests/                              # Comprehensive test suite (451 tests across 29 modules)
+├── tests/                              # Comprehensive test suite (628 tests plus 2 optional skips)
 │   ├── conftest.py                     # Shared pytest fixtures
 │   ├── test_campaign_adversarial.py    # Adversarial nesting, script injection & idempotency tests
 │   ├── test_campaign_api.py            # FastAPI campaign routes, replay & comparison tests

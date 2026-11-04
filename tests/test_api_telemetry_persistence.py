@@ -407,6 +407,12 @@ def test_end_to_end_persisted_evidence_evaluated_by_assurance_engine(test_client
     )
     assert scn_res.status_code == 200
 
+    rule_res = test_client.post(
+        "/api/v1/rules",
+        json={"rule_id": "RULE-E2E", "rule_name": "E2E persistence rule", "rule_format": "sigma"},
+    )
+    assert rule_res.status_code == 200
+
     # 2. Register test run
     run_res = test_client.post(
         "/api/v1/runs",

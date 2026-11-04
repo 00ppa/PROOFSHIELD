@@ -6,10 +6,13 @@ PostgreSQL-backed storage when the core data model stabilises.
 """
 
 from contextlib import contextmanager
+from copy import deepcopy
+from collections.abc import Mapping, Sequence, Set
 from datetime import datetime, timezone
 import ipaddress
 import threading
 from typing import Any, Dict, Generator, List, Optional, Union
+from pydantic import BaseModel
 
 from proofshield.normalisation.engine import extract_execution_token
 from proofshield.schemas.alert import AlertV1
@@ -17,12 +20,107 @@ from proofshield.schemas.assurance_report import CampaignAssuranceReportV1
 from proofshield.schemas.campaign import CampaignDefinitionV1, CampaignRunV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
+from proofshield.schemas.execution import ExecutionEvidenceV1
+from proofshield.schemas.explanation import AnalystExplanationV1
 from proofshield.schemas.ground_truth import GroundTruthV1
 from proofshield.schemas.scenario import ScenarioV1
 from proofshield.schemas.telemetry import NormalizedTelemetryEventV1, RawTelemetryEventV1
 from proofshield.config import StorageBackend, get_settings
 from proofshield.schemas.test_run import TestRunV1
 from proofshield.services.base_store import StoreProtocol, to_comparable_utc
+
+
+class _ReadOnlyMapping(Mapping):
+    """Lazy read-only view over a mapping held by a stored Pydantic model."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: Mapping) -> None:
+        object.__setattr__(self, "_value", value)
+
+    def __getitem__(self, key: Any) -> Any:
+        return _readonly_value(self._value[key])
+
+    def __iter__(self):
+        return iter(self._value)
+
+    def __len__(self) -> int:
+        return len(self._value)
+
+
+class _ReadOnlySequence(Sequence):
+    """Lazy read-only view over a list or tuple in evidence payloads."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: Sequence) -> None:
+        object.__setattr__(self, "_value", value)
+
+    def __getitem__(self, index):
+        value = self._value[index]
+        if isinstance(index, slice):
+            return tuple(_readonly_value(item) for item in value)
+        return _readonly_value(value)
+
+    def __iter__(self):
+        return (_readonly_value(item) for item in self._value)
+
+    def __len__(self) -> int:
+        return len(self._value)
+
+
+class _ReadOnlySet(Set):
+    """Lazy read-only view over a set in an evidence payload."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: Set) -> None:
+        object.__setattr__(self, "_value", value)
+
+    def __contains__(self, value: Any) -> bool:
+        return value in self._value
+
+    def __iter__(self):
+        return (_readonly_value(item) for item in self._value)
+
+    def __len__(self) -> int:
+        return len(self._value)
+
+
+class _ReadOnlyModelView:
+    """Attribute-read-only view over a stored Pydantic model."""
+
+    __slots__ = ("__dict__",)
+
+    def __init__(self, model: Any, fields: Sequence[str]) -> None:
+        values = dict(model.__dict__)
+        for field in fields:
+            values[field] = _readonly_value(getattr(model, field))
+        object.__setattr__(self, "__dict__", values)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise TypeError("read-only evidence view cannot be modified")
+
+    def __delattr__(self, name: str) -> None:
+        raise TypeError("read-only evidence view cannot be modified")
+
+
+def _readonly_value(value: Any) -> Any:
+    """Return a lazy immutable view for nested evidence values."""
+    if isinstance(value, BaseModel):
+        return _ReadOnlyModelView(value, tuple(type(value).model_fields))
+    if isinstance(value, Mapping):
+        return _ReadOnlyMapping(value)
+    if isinstance(value, (list, tuple)):
+        return _ReadOnlySequence(value)
+    if isinstance(value, (set, frozenset)):
+        return _ReadOnlySet(value)
+    return value
+
+
+def _readonly_model(model: Any, fields: Sequence[str]) -> Any:
+    """Make an attribute-read-only snapshot with immutable payload fields."""
+    return _ReadOnlyModelView(model, fields)
 
 
 def hosts_match(host1: str, host2: str) -> bool:
@@ -82,10 +180,12 @@ class InMemoryStore:
         self._rules: Dict[str, DetectionRuleV1] = {}
         self._alerts: Dict[str, AlertV1] = {}
         self._results: Dict[str, DiagnosticResultV1] = {}
+        self._explanations: Dict[str, AnalystExplanationV1] = {}
         self._ground_truths: Dict[str, GroundTruthV1] = {}
         self._campaigns: Dict[str, CampaignDefinitionV1] = {}
         self._campaign_runs: Dict[str, CampaignRunV1] = {}
         self._assurance_reports: Dict[str, CampaignAssuranceReportV1] = {}
+        self._executions: Dict[str, ExecutionEvidenceV1] = {}
 
     def reset(self) -> None:
         """Clear all stored data. Used for test isolation."""
@@ -97,10 +197,12 @@ class InMemoryStore:
             self._rules.clear()
             self._alerts.clear()
             self._results.clear()
+            self._explanations.clear()
             self._ground_truths.clear()
             self._campaigns.clear()
             self._campaign_runs.clear()
             self._assurance_reports.clear()
+            self._executions.clear()
 
     def close(self) -> None:
         """No-op close method to satisfy store lifecycle uniformity."""
@@ -115,17 +217,19 @@ class InMemoryStore:
         """
         with self._lock:
             snapshot = {
-                "scenarios": dict(self._scenarios),
-                "runs": dict(self._runs),
-                "raw_events": dict(self._raw_events),
-                "normalized_events": dict(self._normalized_events),
-                "rules": dict(self._rules),
-                "alerts": dict(self._alerts),
-                "results": dict(self._results),
-                "ground_truths": dict(self._ground_truths),
-                "campaigns": dict(self._campaigns),
-                "campaign_runs": dict(self._campaign_runs),
-                "assurance_reports": dict(self._assurance_reports),
+                "scenarios": deepcopy(self._scenarios),
+                "runs": deepcopy(self._runs),
+                "raw_events": deepcopy(self._raw_events),
+                "normalized_events": deepcopy(self._normalized_events),
+                "rules": deepcopy(self._rules),
+                "alerts": deepcopy(self._alerts),
+                "results": deepcopy(self._results),
+                "explanations": deepcopy(self._explanations),
+                "ground_truths": deepcopy(self._ground_truths),
+                "campaigns": deepcopy(self._campaigns),
+                "campaign_runs": deepcopy(self._campaign_runs),
+                "assurance_reports": deepcopy(self._assurance_reports),
+                "executions": deepcopy(self._executions),
             }
             try:
                 yield
@@ -137,10 +241,12 @@ class InMemoryStore:
                 self._rules = snapshot["rules"]
                 self._alerts = snapshot["alerts"]
                 self._results = snapshot["results"]
+                self._explanations = snapshot["explanations"]
                 self._ground_truths = snapshot["ground_truths"]
                 self._campaigns = snapshot["campaigns"]
                 self._campaign_runs = snapshot["campaign_runs"]
                 self._assurance_reports = snapshot["assurance_reports"]
+                self._executions = snapshot["executions"]
                 raise
 
     # ── Scenarios ─────────────────────────────────────────────────────────
@@ -150,16 +256,18 @@ class InMemoryStore:
         with self._lock:
             if scenario.scenario_id in self._scenarios:
                 raise ValueError(f"Scenario already exists: {scenario.scenario_id}")
-            self._scenarios[scenario.scenario_id] = scenario
-            return scenario
+            stored = scenario.model_copy(deep=True)
+            self._scenarios[scenario.scenario_id] = stored
+            return stored.model_copy(deep=True)
 
     def get_scenario(self, scenario_id: str) -> Optional[ScenarioV1]:
         with self._lock:
-            return self._scenarios.get(scenario_id)
+            item = self._scenarios.get(scenario_id)
+            return item.model_copy(deep=True) if item else None
 
     def list_scenarios(self) -> List[ScenarioV1]:
         with self._lock:
-            return list(self._scenarios.values())
+            return [item.model_copy(deep=True) for item in self._scenarios.values()]
 
     # ── Test Runs ─────────────────────────────────────────────────────────
 
@@ -170,19 +278,21 @@ class InMemoryStore:
                 raise ValueError(f"Run already exists: {run.run_id}")
             if run.scenario_id not in self._scenarios:
                 raise ValueError(f"Scenario not found: {run.scenario_id}")
-            self._runs[run.run_id] = run
-            return run
+            stored = run.model_copy(deep=True)
+            self._runs[run.run_id] = stored
+            return stored.model_copy(deep=True)
 
     def get_run(self, run_id: str) -> Optional[TestRunV1]:
         with self._lock:
-            return self._runs.get(run_id)
+            item = self._runs.get(run_id)
+            return item.model_copy(deep=True) if item else None
 
     def list_runs(self, scenario_id: Optional[str] = None) -> List[TestRunV1]:
         with self._lock:
             runs = list(self._runs.values())
             if scenario_id:
                 runs = [r for r in runs if r.scenario_id == scenario_id]
-            return runs
+            return [item.model_copy(deep=True) for item in runs]
 
     # ── Raw Events ────────────────────────────────────────────────────────
 
@@ -191,16 +301,18 @@ class InMemoryStore:
         with self._lock:
             if event.raw_event_id in self._raw_events:
                 raise ValueError(f"Raw event already exists: {event.raw_event_id}")
-            self._raw_events[event.raw_event_id] = event
-            return event
+            stored = event.model_copy(deep=True)
+            self._raw_events[event.raw_event_id] = stored
+            return stored.model_copy(deep=True)
 
     def get_raw_event(self, raw_event_id: str) -> Optional[RawTelemetryEventV1]:
         with self._lock:
-            return self._raw_events.get(raw_event_id)
+            item = self._raw_events.get(raw_event_id)
+            return item.model_copy(deep=True) if item else None
 
     def list_raw_events(self) -> List[RawTelemetryEventV1]:
         with self._lock:
-            return list(self._raw_events.values())
+            return [item.model_copy(deep=True) for item in self._raw_events.values()]
 
     # ── Normalized Events ─────────────────────────────────────────────────
 
@@ -213,27 +325,31 @@ class InMemoryStore:
                 raise ValueError(
                     f"Normalized event already exists: {event.normalized_event_id}"
                 )
-            self._normalized_events[event.normalized_event_id] = event
-            return event
+            stored = event.model_copy(deep=True)
+            self._normalized_events[event.normalized_event_id] = stored
+            return stored.model_copy(deep=True)
 
     def get_normalized_event(
         self, event_id: str
     ) -> Optional[NormalizedTelemetryEventV1]:
         with self._lock:
-            return self._normalized_events.get(event_id)
+            item = self._normalized_events.get(event_id)
+            return item.model_copy(deep=True) if item else None
 
     def list_normalized_events(self) -> List[NormalizedTelemetryEventV1]:
         with self._lock:
-            return list(self._normalized_events.values())
+            return [item.model_copy(deep=True) for item in self._normalized_events.values()]
 
     def get_events_for_run(
-        self, run: TestRunV1
+        self, run: TestRunV1, copy: bool = True
     ) -> List[NormalizedTelemetryEventV1]:
         """Correlate normalized events to a test run by host and time window.
 
         Returns events where host matches via hosts_match() and the
         normalized_timestamp falls within [window_start, window_end].
-        Results are sorted chronologically and deterministically.
+        Results are sorted chronologically and deterministically. ``copy=False``
+        returns isolated snapshots for internal evaluation without exposing
+        stored model instances or mutable nested payloads.
         """
         with self._lock:
             matched = []
@@ -252,13 +368,19 @@ class InMemoryStore:
                     ts = ts.replace(tzinfo=w_start.tzinfo)
                 if w_start <= ts <= w_end:
                     matched.append(event)
-            return sorted(
+            ordered = sorted(
                 matched,
                 key=lambda e: (
                     e.normalized_timestamp or datetime.min.replace(tzinfo=timezone.utc),
                     e.normalized_event_id,
                 ),
             )
+            if copy:
+                return [item.model_copy(deep=True) for item in ordered]
+            return [
+                _readonly_model(item, ("hashes", "extra_attributes"))
+                for item in ordered
+            ]
 
     # ── Detection Rules ───────────────────────────────────────────────────
 
@@ -267,16 +389,18 @@ class InMemoryStore:
         with self._lock:
             if rule.rule_id in self._rules:
                 raise ValueError(f"Rule already exists: {rule.rule_id}")
-            self._rules[rule.rule_id] = rule
-            return rule
+            stored = rule.model_copy(deep=True)
+            self._rules[rule.rule_id] = stored
+            return stored.model_copy(deep=True)
 
     def get_rule(self, rule_id: str) -> Optional[DetectionRuleV1]:
         with self._lock:
-            return self._rules.get(rule_id)
+            item = self._rules.get(rule_id)
+            return item.model_copy(deep=True) if item else None
 
     def list_rules(self) -> List[DetectionRuleV1]:
         with self._lock:
-            return list(self._rules.values())
+            return [item.model_copy(deep=True) for item in self._rules.values()]
 
     # ── Alerts ────────────────────────────────────────────────────────────
 
@@ -285,37 +409,40 @@ class InMemoryStore:
         with self._lock:
             if alert.alert_id in self._alerts:
                 raise ValueError(f"Alert already exists: {alert.alert_id}")
-            if alert.ingested_at is None:
-                alert.ingested_at = datetime.now(timezone.utc)
-            if alert.alert_timestamp is None:
-                alert.metadata["ingestion_time_only"] = True
-
-            # Structured-first token extraction / conflict verification on alert
+            stored = alert.model_copy(deep=True)
+            if stored.ingested_at is None:
+                stored.ingested_at = datetime.now(timezone.utc)
+            if stored.alert_timestamp is None:
+                stored.metadata["ingestion_time_only"] = True
             token = extract_execution_token(
-                payload=alert.metadata,
-                explicit_token=alert.execution_token,
-                text_fields=[alert.alert_title],
+                payload=stored.metadata,
+                explicit_token=stored.execution_token,
+                text_fields=[stored.alert_title],
             )
-            alert.execution_token = token
-
-            self._alerts[alert.alert_id] = alert
-            return alert
+            stored.execution_token = token
+            self._alerts[stored.alert_id] = stored
+            return stored.model_copy(deep=True)
 
     def get_alert(self, alert_id: str) -> Optional[AlertV1]:
         with self._lock:
-            return self._alerts.get(alert_id)
+            item = self._alerts.get(alert_id)
+            return item.model_copy(deep=True) if item else None
 
     def list_alerts(self) -> List[AlertV1]:
         with self._lock:
-            return list(self._alerts.values())
+            return [item.model_copy(deep=True) for item in self._alerts.values()]
 
     def list_alerts_for_rule(
         self,
         rule_id: str,
         window_start: Optional[datetime] = None,
         window_end: Optional[datetime] = None,
+        copy: bool = True,
     ) -> List[AlertV1]:
-        """Return alerts referencing a given detection rule ID, optionally bounded by time."""
+        """Return alerts, optionally bounded by time.
+
+        ``copy=False`` returns isolated snapshots for internal evaluation.
+        """
         with self._lock:
             matched = []
             for a in self._alerts.values():
@@ -344,20 +471,24 @@ class InMemoryStore:
                         if ts > w_end:
                             continue
                 matched.append(a)
-            return sorted(
+            ordered = sorted(
                 matched,
                 key=lambda a: (
                     a.alert_timestamp or datetime.min.replace(tzinfo=timezone.utc),
                     a.alert_id,
                 ),
             )
+            if copy:
+                return [item.model_copy(deep=True) for item in ordered]
+            return [_readonly_model(item, ("metadata",)) for item in ordered]
 
-    def get_alerts_for_run(self, run: TestRunV1) -> List[AlertV1]:
+    def get_alerts_for_run(self, run: TestRunV1, copy: bool = True) -> List[AlertV1]:
         """Correlate alerts to a test run by host and time window.
 
         Returns alerts where host_id matches via hosts_match() and the
         alert_timestamp falls within [window_start, window_end].
-        Results are sorted chronologically and deterministically.
+        Results are sorted chronologically and deterministically. ``copy=False``
+        returns isolated snapshots for internal evaluation.
         """
         with self._lock:
             matched = []
@@ -376,37 +507,62 @@ class InMemoryStore:
                     ts = ts.replace(tzinfo=w_start.tzinfo)
                 if w_start <= ts <= w_end:
                     matched.append(alert)
-            return sorted(
+            ordered = sorted(
                 matched,
                 key=lambda a: (
                     a.alert_timestamp or datetime.min.replace(tzinfo=timezone.utc),
                     a.alert_id,
                 ),
             )
+            if copy:
+                return [item.model_copy(deep=True) for item in ordered]
+            return [_readonly_model(item, ("metadata",)) for item in ordered]
 
     # ── Diagnostic Results ────────────────────────────────────────────────
 
     def add_result(self, result: DiagnosticResultV1) -> DiagnosticResultV1:
         """Store a diagnostic result. Overwrites previous result for same run."""
         with self._lock:
-            self._results[result.diagnostic_id] = result
-            return result
+            self._results[result.diagnostic_id] = result.model_copy(deep=True)
+            return result.model_copy(deep=True)
 
     def get_result(self, result_id: str) -> Optional[DiagnosticResultV1]:
         with self._lock:
-            return self._results.get(result_id)
+            result = self._results.get(result_id)
+            return result.model_copy(deep=True) if result else None
 
     def get_result_for_run(self, run_id: str) -> Optional[DiagnosticResultV1]:
         """Return the most recent diagnostic result for a test run."""
         with self._lock:
             for result in reversed(list(self._results.values())):
                 if result.test_run_id == run_id:
-                    return result
+                    return result.model_copy(deep=True)
             return None
 
     def list_results(self) -> List[DiagnosticResultV1]:
         with self._lock:
-            return list(self._results.values())
+            return [item.model_copy(deep=True) for item in self._results.values()]
+
+    # ── Analyst Explanations ───────────────────────────────────────────────
+
+    def add_explanation(self, explanation: AnalystExplanationV1) -> AnalystExplanationV1:
+        with self._lock:
+            if explanation.explanation_id in self._explanations:
+                raise ValueError(f"Explanation already exists: {explanation.explanation_id}")
+            self._explanations[explanation.explanation_id] = explanation.model_copy(deep=True)
+            return explanation.model_copy(deep=True)
+
+    def get_explanation(self, explanation_id: str) -> Optional[AnalystExplanationV1]:
+        with self._lock:
+            item = self._explanations.get(explanation_id)
+            return item.model_copy(deep=True) if item else None
+
+    def list_explanations(self, run_id: Optional[str] = None) -> List[AnalystExplanationV1]:
+        with self._lock:
+            values = list(self._explanations.values())
+            if run_id is not None:
+                values = [item for item in values if item.test_run_id == run_id]
+            return [item.model_copy(deep=True) for item in values]
 
     # ── Ground Truth ──────────────────────────────────────────────────────
 
@@ -415,19 +571,20 @@ class InMemoryStore:
         with self._lock:
             if gt.ground_truth_id in self._ground_truths:
                 raise ValueError(f"Ground truth already exists: {gt.ground_truth_id}")
-            self._ground_truths[gt.ground_truth_id] = gt
-            return gt
+            stored = gt.model_copy(deep=True)
+            self._ground_truths[gt.ground_truth_id] = stored
+            return stored.model_copy(deep=True)
 
     def get_ground_truth_for_run(self, run_id: str) -> Optional[GroundTruthV1]:
         with self._lock:
             for gt in self._ground_truths.values():
                 if gt.run_id == run_id:
-                    return gt
+                    return gt.model_copy(deep=True)
             return None
 
     def list_ground_truths(self) -> List[GroundTruthV1]:
         with self._lock:
-            return list(self._ground_truths.values())
+            return [item.model_copy(deep=True) for item in self._ground_truths.values()]
 
     # ── Campaigns ─────────────────────────────────────────────────────────
 
@@ -519,6 +676,44 @@ class InMemoryStore:
                 reports = [r for r in reports if r.campaign_run_id == run_id]
             sorted_reports = sorted(reports, key=lambda r: to_comparable_utc(r.generated_at))
             return [r.model_copy(deep=True) for r in sorted_reports]
+
+    # ── Execution Records ──────────────────────────────────────────────────
+
+    def add_execution(self, execution: ExecutionEvidenceV1) -> ExecutionEvidenceV1:
+        """Store an execution evidence record. Raises ValueError on duplicate ID."""
+        with self._lock:
+            if execution.execution_id in self._executions:
+                raise ValueError(f"Execution record already exists: {execution.execution_id}")
+            self._executions[execution.execution_id] = execution.model_copy(deep=True)
+            return execution.model_copy(deep=True)
+
+    def get_execution(self, execution_id: str) -> Optional[ExecutionEvidenceV1]:
+        """Retrieve an execution evidence record by its identifier."""
+        with self._lock:
+            rec = self._executions.get(execution_id)
+            return rec.model_copy(deep=True) if rec else None
+
+    def list_executions(
+        self,
+        scenario_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[ExecutionEvidenceV1]:
+        """List execution evidence records, optionally filtered."""
+        with self._lock:
+            results = list(self._executions.values())
+            if scenario_id is not None:
+                results = [r for r in results if r.scenario_id == scenario_id]
+            if run_id is not None:
+                results = [r for r in results if r.test_run_id == run_id]
+            if status is not None:
+                status_str = status.value if hasattr(status, "value") else str(status)
+                results = [
+                    r for r in results
+                    if (r.status.value if hasattr(r.status, "value") else str(r.status)) == status_str
+                ]
+            results.sort(key=lambda r: to_comparable_utc(r.started_at))
+            return [r.model_copy(deep=True) for r in results]
 
 
 # Module-level singleton and initialization lock

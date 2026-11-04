@@ -161,7 +161,12 @@ def _run_case(
     """Ingest evidence and evaluate. Returns the diagnostic result."""
     store.add_scenario(scenario)
     store.add_run(run)
-    for r in (rules or []):
+    effective_rules = rules or ([DetectionRuleV1(
+        rule_id=scenario.expected_detection_rule_id,
+        rule_name=f"Test rule {scenario.expected_detection_rule_id}",
+        rule_format="sigma",
+    )] if scenario.expected_detection_rule_id else [])
+    for r in effective_rules:
         try:
             store.add_rule(r)
         except ValueError:

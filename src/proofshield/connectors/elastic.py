@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,13 +22,13 @@ import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import urllib.error
 import urllib.request
-import uuid
 
 import dateutil.parser
 
 from proofshield.normalisation.engine import extract_execution_token
 from proofshield.schemas.alert import AlertV1
 from proofshield.schemas.telemetry import RawTelemetryEventV1
+from proofshield.connectors.transport import validate_source_url
 from proofshield.services.base_store import StoreProtocol
 
 
@@ -134,11 +135,122 @@ _SENSITIVE_HEADER_KEYS = {
     "set-cookie",
 }
 
-import re
 _AUTH_VALUE_PATTERN = re.compile(r"^(?:Bearer|ApiKey|Basic)\s+[A-Za-z0-9_\-\.\+/=]+", re.IGNORECASE)
 
 
-import math
+DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_ALLOWED_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_ALLOWED_RETRIES = 10
+
+
+def _first_present(data: Dict[str, Any], paths: Sequence[str]) -> Any:
+    """Return the first present value without treating valid zero values as absent."""
+    for path in paths:
+        value = _get_nested(data, path)
+        if value is not None:
+            return value
+    return None
+
+
+def _hit_source(hit: Dict[str, Any]) -> Dict[str, Any]:
+    source = hit.get("_source", hit)
+    if not isinstance(source, dict):
+        raise ElasticClientError(
+            f"Elasticsearch search hit has invalid '_source' type '{type(source).__name__}'"
+        )
+    return source
+
+
+def _hit_identifier(hit: Dict[str, Any], source: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    source = source if source is not None else _hit_source(hit)
+    raw_id = _first_present(
+        hit,
+        ("_id",),
+    )
+    if raw_id is None:
+        raw_id = _first_present(
+            source,
+            (
+                "_id",
+                "event.id",
+                "kibana.alert.uuid",
+                "kibana.alert.id",
+                "signal.id",
+                "signal.parent.id",
+                "alert_id",
+            ),
+        )
+    if not isinstance(raw_id, str) or not raw_id.strip():
+        return None
+    return raw_id.strip()
+
+
+def _validate_search_page(
+    body: Any,
+    *,
+    require_timestamps: bool = False,
+) -> Tuple[List[Dict[str, Any]], Optional[int], str]:
+    """Validate one Elasticsearch search response before pagination uses it."""
+    if not isinstance(body, dict):
+        raise ElasticClientError(
+            f"Malformed Elasticsearch response: expected object, received {type(body).__name__}"
+        )
+    hits_container = body.get("hits")
+    if not isinstance(hits_container, dict):
+        raise ElasticClientError("Malformed Elasticsearch response: 'hits' must be an object")
+    page_hits = hits_container.get("hits")
+    if not isinstance(page_hits, list):
+        raise ElasticClientError("Malformed Elasticsearch response: 'hits.hits' must be an array")
+
+    for position, hit in enumerate(page_hits):
+        if not isinstance(hit, dict):
+            raise ElasticClientError(
+                f"Malformed Elasticsearch response: hit {position} must be an object"
+            )
+        if "_source" not in hit:
+            raise ElasticClientError(
+                f"Malformed Elasticsearch response: hit {position} lacks '_source'"
+            )
+        source = _hit_source(hit)
+        if _hit_identifier(hit, source) is None:
+            raise ElasticClientError(
+                f"Malformed Elasticsearch response: hit {position} lacks a valid identifier"
+            )
+        if require_timestamps:
+            raw_timestamp = _first_present(source, ("@timestamp", "event.created"))
+            if raw_timestamp is None:
+                raise ElasticClientError(
+                    f"Malformed Elasticsearch response: hit {position} lacks a telemetry timestamp"
+                )
+            try:
+                if _parse_timestamp(raw_timestamp) is None:
+                    raise ElasticClientError(
+                        f"Malformed Elasticsearch response: hit {position} has an empty telemetry timestamp"
+                    )
+            except ElasticAlertMappingError as exc:
+                raise ElasticClientError(
+                    f"Malformed Elasticsearch response: hit {position} has an invalid telemetry timestamp"
+                ) from exc
+
+    total_raw = hits_container.get("total")
+    if total_raw is None:
+        total = None
+        relation = "eq"
+    elif isinstance(total_raw, dict):
+        value = total_raw.get("value")
+        relation_raw = total_raw.get("relation", "eq")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ElasticClientError("Malformed Elasticsearch response: 'hits.total.value' must be a non-negative integer")
+        if relation_raw not in ("eq", "gte"):
+            raise ElasticClientError("Malformed Elasticsearch response: 'hits.total.relation' must be 'eq' or 'gte'")
+        total = value
+        relation = relation_raw
+    elif isinstance(total_raw, int) and not isinstance(total_raw, bool) and total_raw >= 0:
+        total = total_raw
+        relation = "eq"
+    else:
+        raise ElasticClientError("Malformed Elasticsearch response: 'hits.total' has an invalid type")
+    return page_hits, total, relation
 
 
 def _sanitize_metadata(
@@ -265,6 +377,11 @@ def _parse_timestamp(raw_val: Any) -> Optional[datetime]:
             return raw_val.replace(tzinfo=timezone.utc)
         return raw_val.astimezone(timezone.utc)
 
+    if isinstance(raw_val, bool):
+        raise ElasticAlertMappingError(
+            f"Unsupported timestamp type 'bool' for value '{raw_val}'"
+        )
+
     if isinstance(raw_val, (int, float)):
         if math.isnan(raw_val) or math.isinf(raw_val):
             raise ElasticAlertMappingError(
@@ -327,20 +444,12 @@ def map_elastic_alert(doc: Dict[str, Any]) -> AlertV1:
         )
 
     # 1. Identifier resolution
-    raw_id = (
-        doc.get("_id")
-        or _get_nested(source, "_id")
-        or _get_nested(source, "kibana.alert.uuid")
-        or _get_nested(source, "kibana.alert.id")
-        or _get_nested(source, "signal.id")
-        or _get_nested(source, "signal.parent.id")
-        or _get_nested(source, "alert_id")
-    )
-    if raw_id is None or not str(raw_id).strip():
+    raw_id = _hit_identifier(doc, source)
+    if raw_id is None:
         raise ElasticAlertMappingError(
             "Elastic alert document lacks a valid identifier ('_id', 'kibana.alert.uuid', etc.)"
         )
-    source_alert_id = str(raw_id).strip()
+    source_alert_id = raw_id
 
     # Prefix with 'elastic:' for internal uniqueness in ProofShield if not already prefixed
     alert_id = source_alert_id if source_alert_id.startswith("elastic:") else f"elastic:{source_alert_id}"
@@ -369,12 +478,9 @@ def map_elastic_alert(doc: Dict[str, Any]) -> AlertV1:
     host_id = str(host_val).strip()
 
     # 3. Timestamp resolution
-    raw_ts = (
-        _get_nested(source, "@timestamp")
-        or _get_nested(source, "kibana.alert.start")
-        or _get_nested(source, "signal.original_time")
-        or _get_nested(source, "timestamp")
-        or _get_nested(source, "event.created")
+    raw_ts = _first_present(
+        source,
+        ("@timestamp", "kibana.alert.start", "signal.original_time", "timestamp", "event.created"),
     )
     alert_timestamp = _parse_timestamp(raw_ts)
 
@@ -526,6 +632,7 @@ class ElasticConnectorSettings:
         request_timeout: float = 10.0,
         max_results: int = 100,
         enabled: bool = False,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         url_clean = str(base_url).strip()
         if not url_clean:
@@ -534,7 +641,7 @@ class ElasticConnectorSettings:
             raise ValueError(
                 f"Elastic base URL must start with 'http://' or 'https://': '{base_url}'"
             )
-        self.base_url = url_clean.rstrip("/")
+        self.base_url = validate_source_url(url_clean)
 
         api_key_clean = str(api_key).strip()
         if not api_key_clean:
@@ -563,7 +670,7 @@ class ElasticConnectorSettings:
 
         try:
             t_val = float(request_timeout)
-            if t_val <= 0:
+            if not math.isfinite(t_val) or t_val <= 0:
                 raise ValueError()
             self.request_timeout = t_val
         except (ValueError, TypeError):
@@ -572,13 +679,32 @@ class ElasticConnectorSettings:
             )
 
         try:
+            if isinstance(max_results, bool):
+                raise ValueError()
             m_val = int(max_results)
+            if isinstance(max_results, float) and not max_results.is_integer():
+                raise ValueError()
             if m_val < 1 or m_val > 10000:
                 raise ValueError()
             self.max_results = m_val
         except (ValueError, TypeError):
             raise ValueError(
                 f"Elastic max_results must be an integer between 1 and 10000: '{max_results}'"
+            )
+
+        try:
+            if isinstance(max_response_bytes, bool):
+                raise ValueError()
+            response_limit = int(max_response_bytes)
+            if isinstance(max_response_bytes, float) and not max_response_bytes.is_integer():
+                raise ValueError()
+            if response_limit < 1 or response_limit > MAX_ALLOWED_RESPONSE_BYTES:
+                raise ValueError()
+            self.max_response_bytes = response_limit
+        except (ValueError, TypeError):
+            raise ValueError(
+                "Elastic max_response_bytes must be an integer between 1 and "
+                f"{MAX_ALLOWED_RESPONSE_BYTES}: '{max_response_bytes}'"
             )
 
         self.enabled = bool(enabled)
@@ -593,6 +719,9 @@ class ElasticConnectorSettings:
         telemetry_index = os.environ.get("PROOFSHIELD_ELASTIC_TELEMETRY_INDEX", "logs-*")
         timeout_env = os.environ.get("PROOFSHIELD_ELASTIC_TIMEOUT", "10.0")
         max_env = os.environ.get("PROOFSHIELD_ELASTIC_MAX_RESULTS", "100")
+        response_max_env = os.environ.get(
+            "PROOFSHIELD_ELASTIC_MAX_RESPONSE_BYTES", str(DEFAULT_MAX_RESPONSE_BYTES)
+        )
         enabled_env = os.environ.get("PROOFSHIELD_ELASTIC_ENABLED", "false").strip().lower()
 
         enabled = enabled_env in ("true", "1", "yes", "on")
@@ -606,6 +735,7 @@ class ElasticConnectorSettings:
             request_timeout=float(timeout_env),
             max_results=int(max_env),
             enabled=enabled,
+            max_response_bytes=int(response_max_env),
         )
 
     def __repr__(self) -> str:
@@ -617,6 +747,7 @@ class ElasticConnectorSettings:
             f"telemetry_index_pattern={self.telemetry_index_pattern!r}, "
             f"request_timeout={self.request_timeout}, "
             f"max_results={self.max_results}, "
+            f"max_response_bytes={self.max_response_bytes}, "
             f"enabled={self.enabled})"
         )
 
@@ -710,6 +841,52 @@ class ElasticAlertClient:
         else:
             self._ssl_context = None
 
+    def _validate_search_parameters(
+        self,
+        *,
+        start_time: Optional[datetime],
+        end_time: Optional[datetime],
+        limit: Optional[int],
+        batch_size: Optional[int],
+        max_retries: int = 2,
+        rule_ids: Optional[Sequence[str]] = None,
+        host: Optional[str] = None,
+        process_name: Optional[str] = None,
+        query_string: Optional[str] = None,
+    ) -> None:
+        """Reject ambiguous request parameters before constructing a query."""
+        for name, value in (("start_time", start_time), ("end_time", end_time)):
+            if value is not None and not isinstance(value, datetime):
+                raise ElasticClientError(f"Invalid {name}; expected a datetime")
+        if start_time is not None and end_time is not None:
+            start_utc = start_time.astimezone(timezone.utc) if start_time.tzinfo else start_time.replace(tzinfo=timezone.utc)
+            end_utc = end_time.astimezone(timezone.utc) if end_time.tzinfo else end_time.replace(tzinfo=timezone.utc)
+            if start_utc > end_utc:
+                raise ElasticClientError("Invalid Elasticsearch time window: start_time must not exceed end_time")
+
+        for name, value in (("limit", limit), ("batch_size", batch_size)):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ElasticClientError(f"Invalid {name} '{value}'; expected a positive integer")
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or not 0 <= max_retries <= MAX_ALLOWED_RETRIES:
+            raise ElasticClientError(
+                f"Invalid max_retries '{max_retries}'; expected an integer from 0 to {MAX_ALLOWED_RETRIES}"
+            )
+
+        if rule_ids is not None:
+            if isinstance(rule_ids, (str, bytes)):
+                raise ElasticClientError("Invalid rule_ids; expected a sequence of non-empty strings")
+            try:
+                for rule_id in rule_ids:
+                    if not isinstance(rule_id, str) or not rule_id.strip():
+                        raise ElasticClientError("Invalid rule_ids; expected a sequence of non-empty strings")
+            except TypeError as exc:
+                raise ElasticClientError("Invalid rule_ids; expected a sequence of non-empty strings") from exc
+        for name, value in (("host", host), ("process_name", process_name), ("query_string", query_string)):
+            if value is not None and not isinstance(value, str):
+                raise ElasticClientError(f"Invalid {name}; expected a string")
+
     def _post_search(
         self,
         endpoint_url: str,
@@ -717,6 +894,10 @@ class ElasticAlertClient:
         max_retries: int = 2,
     ) -> Dict[str, Any]:
         """Execute POST search against Elasticsearch with retry on transient status codes."""
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or not 0 <= max_retries <= MAX_ALLOWED_RETRIES:
+            raise ElasticClientError(
+                f"Invalid max_retries '{max_retries}'; expected an integer from 0 to {MAX_ALLOWED_RETRIES}"
+            )
         payload_bytes = json.dumps(query_dsl).encode("utf-8")
         req = urllib.request.Request(
             url=endpoint_url,
@@ -738,8 +919,53 @@ class ElasticAlertClient:
                     timeout=self.settings.request_timeout,
                     context=self._ssl_context,
                 ) as resp:
-                    resp_data = resp.read().decode("utf-8")
-                    return json.loads(resp_data)
+                    content_length = None
+                    headers = getattr(resp, "headers", None)
+                    if headers is not None:
+                        raw_length = headers.get("Content-Length")
+                        if raw_length is not None:
+                            try:
+                                content_length = int(raw_length)
+                            except (TypeError, ValueError) as exc:
+                                raise ElasticClientError(
+                                    "Malformed Elasticsearch response: invalid Content-Length"
+                                ) from exc
+                            if content_length < 0:
+                                raise ElasticClientError(
+                                    "Malformed Elasticsearch response: negative Content-Length"
+                                )
+                            if content_length > self.settings.max_response_bytes:
+                                raise ElasticClientError(
+                                    "Elasticsearch response exceeds the configured byte limit"
+                                )
+
+                    try:
+                        raw_bytes = resp.read(self.settings.max_response_bytes + 1)
+                    except TypeError:
+                        # Compatibility with minimal test doubles that expose read()
+                        # without urllib's optional size argument. Real HTTPResponse
+                        # objects always take the bounded read argument above.
+                        raw_bytes = resp.read()
+                    if not isinstance(raw_bytes, (bytes, bytearray)):
+                        raise ElasticClientError(
+                            "Malformed Elasticsearch response: response body is not bytes"
+                        )
+                    if len(raw_bytes) > self.settings.max_response_bytes:
+                        raise ElasticClientError(
+                            "Elasticsearch response exceeds the configured byte limit"
+                        )
+                    try:
+                        resp_data = bytes(raw_bytes).decode("utf-8")
+                        body = json.loads(resp_data)
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise ElasticClientError(
+                            "Malformed Elasticsearch response: invalid JSON body"
+                        ) from exc
+                    if not isinstance(body, dict):
+                        raise ElasticClientError(
+                            "Malformed Elasticsearch response: top-level JSON value must be an object"
+                        )
+                    return body
             except urllib.error.HTTPError as exc:
                 if exc.code in (429, 502, 503, 504) and attempt < max_retries:
                     attempt += 1
@@ -804,6 +1030,14 @@ class ElasticAlertClient:
         Raises:
             ElasticClientError: On network, HTTP, TLS, timeout, or authentication errors.
         """
+        self._validate_search_parameters(
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+            batch_size=batch_size,
+            rule_ids=rule_ids,
+            host=host,
+        )
         filters: List[Dict[str, Any]] = []
 
         # Time range filter on ECS @timestamp
@@ -854,7 +1088,7 @@ class ElasticAlertClient:
                 }
             )
 
-        effective_limit = min(limit or self.settings.max_results, self.settings.max_results)
+        effective_limit = min(limit if limit is not None else self.settings.max_results, self.settings.max_results)
         endpoint_url = f"{self.settings.base_url}/{self.settings.index_pattern}/_search"
 
         all_hits: List[Dict[str, Any]] = []
@@ -862,7 +1096,7 @@ class ElasticAlertClient:
         self.last_search_total = None
         self.last_search_relation = "eq"
         self.last_search_truncated = False
-        page_chunk = batch_size if (batch_size is not None and batch_size > 0) else 100
+        page_chunk = min(batch_size if batch_size is not None else 100, self.settings.max_results)
         page_hits: List[Dict[str, Any]] = []
         page_size = page_chunk
 
@@ -880,21 +1114,12 @@ class ElasticAlertClient:
                 query_dsl["search_after"] = search_after
 
             body = self._post_search(endpoint_url, query_dsl, max_retries=2)
-            hits_container = body.get("hits", {})
-            page_hits = hits_container.get("hits", [])
+            page_hits, response_total, response_relation = _validate_search_page(body)
 
             # Parse hits.total (supports integer or {value: int, relation: str})
             if self.last_search_total is None:
-                total_raw = hits_container.get("total")
-                if isinstance(total_raw, dict):
-                    self.last_search_total = int(total_raw.get("value", 0))
-                    self.last_search_relation = str(total_raw.get("relation", "eq")).strip().lower()
-                elif isinstance(total_raw, (int, float)):
-                    self.last_search_total = int(total_raw)
-                    self.last_search_relation = "eq"
-                else:
-                    self.last_search_total = len(page_hits)
-                    self.last_search_relation = "eq"
+                self.last_search_total = response_total if response_total is not None else len(page_hits)
+                self.last_search_relation = response_relation
 
             if not page_hits:
                 break
@@ -956,7 +1181,10 @@ class ElasticAlertClient:
             raise_on_truncation=raise_on_truncation,
             batch_size=batch_size,
         )
-        return map_elastic_alerts_batch(hits, deduplicate=deduplicate)
+        try:
+            return map_elastic_alerts_batch(hits, deduplicate=deduplicate)
+        except ElasticAlertMappingError as exc:
+            raise ElasticClientError(f"Malformed Elasticsearch alert hit: {exc}") from exc
 
     def poll_and_ingest(
         self,
@@ -1078,6 +1306,16 @@ class ElasticAlertClient:
         Returns:
             ElasticTelemetryBatch with hits, count, and truncation status.
         """
+        self._validate_search_parameters(
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+            batch_size=batch_size,
+            max_retries=max_retries,
+            host=host,
+            process_name=process_name,
+            query_string=query_string,
+        )
         filters: List[Dict[str, Any]] = []
 
         range_filter: Dict[str, Any] = {}
@@ -1125,7 +1363,7 @@ class ElasticAlertClient:
         if query_string and query_string.strip():
             filters.append({"query_string": {"query": query_string.strip()}})
 
-        effective_limit = min(limit or self.settings.max_results, self.settings.max_results)
+        effective_limit = min(limit if limit is not None else self.settings.max_results, self.settings.max_results)
         endpoint_url = f"{self.settings.base_url}/{self.settings.telemetry_index_pattern}/_search"
 
         all_hits: List[Dict[str, Any]] = []
@@ -1133,7 +1371,7 @@ class ElasticAlertClient:
         total_matched: Optional[int] = None
         relation: str = "eq"
         is_truncated: bool = False
-        page_chunk = batch_size if (batch_size is not None and batch_size > 0) else 100
+        page_chunk = min(batch_size if batch_size is not None else 100, self.settings.max_results)
         page_hits: List[Dict[str, Any]] = []
         page_size = page_chunk
 
@@ -1151,20 +1389,14 @@ class ElasticAlertClient:
                 query_dsl["search_after"] = search_after
 
             body = self._post_search(endpoint_url, query_dsl, max_retries=max_retries)
-            hits_container = body.get("hits", {})
-            page_hits = hits_container.get("hits", [])
+            page_hits, response_total, response_relation = _validate_search_page(
+                body,
+                require_timestamps=True,
+            )
 
             if total_matched is None:
-                total_raw = hits_container.get("total")
-                if isinstance(total_raw, dict):
-                    total_matched = int(total_raw.get("value", 0))
-                    relation = str(total_raw.get("relation", "eq")).strip().lower()
-                elif isinstance(total_raw, (int, float)):
-                    total_matched = int(total_raw)
-                    relation = "eq"
-                else:
-                    total_matched = len(page_hits)
-                    relation = "eq"
+                total_matched = response_total if response_total is not None else len(page_hits)
+                relation = response_relation
 
             if not page_hits:
                 break
@@ -1219,18 +1451,36 @@ class ElasticAlertClient:
     def map_hits_to_raw_telemetry(hits: Iterable[Dict[str, Any]]) -> List[RawTelemetryEventV1]:
         """Convert raw Elastic hits to canonical RawTelemetryEventV1 models."""
         raw_events: List[RawTelemetryEventV1] = []
-        for hit in hits:
-            source = hit.get("_source", hit)
-            hit_id = str(hit.get("_id") or _get_nested(source, "_id") or _get_nested(source, "event.id") or uuid.uuid4().hex[:12]).strip()
+        for position, hit in enumerate(hits):
+            if not isinstance(hit, dict):
+                raise ElasticAlertMappingError(
+                    f"Elastic telemetry hit {position} must be an object"
+                )
+            try:
+                source = hit.get("_source", hit)
+                if not isinstance(source, dict):
+                    raise ElasticAlertMappingError(
+                        f"Elastic telemetry hit {position} has an invalid '_source'"
+                    )
+                hit_id = _hit_identifier(hit, source)
+                if hit_id is None:
+                    raise ElasticAlertMappingError(
+                        f"Elastic telemetry hit {position} lacks a valid identifier"
+                    )
+            except ElasticClientError as exc:
+                raise ElasticAlertMappingError(str(exc)) from exc
             raw_event_id = f"elastic:raw:{hit_id}" if not hit_id.startswith("elastic:") else hit_id
 
-            ts_raw = _get_nested(source, "@timestamp") or _get_nested(source, "event.created")
-            try:
-                source_ts = _parse_timestamp(ts_raw) if ts_raw else None
-            except Exception:
-                source_ts = None
+            ts_raw = _first_present(source, ("@timestamp", "event.created"))
+            if ts_raw is None:
+                raise ElasticAlertMappingError(
+                    f"Elastic telemetry hit {position} lacks a source timestamp"
+                )
+            source_ts = _parse_timestamp(ts_raw)
             if source_ts is None:
-                source_ts = datetime.now(timezone.utc)
+                raise ElasticAlertMappingError(
+                    f"Elastic telemetry hit {position} has an empty source timestamp"
+                )
 
             sanitized_payload = _sanitize_metadata(deepcopy(source))
 
@@ -1271,7 +1521,10 @@ class ElasticAlertClient:
             batch_size=batch_size,
             max_retries=max_retries,
         )
-        return self.map_hits_to_raw_telemetry(batch.hits)
+        try:
+            return self.map_hits_to_raw_telemetry(batch.hits)
+        except ElasticAlertMappingError as exc:
+            raise ElasticClientError(f"Malformed Elasticsearch telemetry hit: {exc}") from exc
 
     def poll_and_ingest_telemetry(
         self,
@@ -1342,4 +1595,3 @@ class ElasticAlertClient:
 
 # Backwards compatibility alias
 ElasticClient = ElasticAlertClient
-

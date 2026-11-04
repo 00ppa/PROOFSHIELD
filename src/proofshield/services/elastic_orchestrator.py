@@ -94,6 +94,8 @@ class ElasticAssuranceOrchestrator:
     - Bridges cleanly to AssuranceEngine for downstream root-cause diagnosis.
     """
 
+    source_name = "Elasticsearch"
+
     def __init__(
         self,
         client: ElasticAlertClient,
@@ -240,7 +242,7 @@ class ElasticAssuranceOrchestrator:
             or report.telemetry_status == TelemetryRetrievalStatus.FAILED
             or report.normalization_status in (NormalizationStatus.FAILED, NormalizationStatus.PARTIAL)
         ):
-            err_msg = "; ".join(report.errors) if report.errors else "Elasticsearch evidence retrieval failed"
+            err_msg = "; ".join(report.errors) if report.errors else f"{self.source_name} evidence retrieval failed"
             result = DiagnosticResultV1(
                 schema_version="v1",
                 diagnostic_id=f"DIAG-ERR-{uuid.uuid4().hex[:12].upper()}",
@@ -249,7 +251,7 @@ class ElasticAssuranceOrchestrator:
                 predicted_category=DiagnosticCategory.ERROR,
                 failure_category=FailureCategory.UNSPECIFIED,
                 confidence="uncertain",
-                reason=f"Evidence collection failed from Elasticsearch: {err_msg}",
+                reason=f"Evidence collection failed from {self.source_name}: {err_msg}",
                 diagnostic_reasons=report.errors,
                 evaluated_at=datetime.now(timezone.utc),
                 metadata={
@@ -261,14 +263,16 @@ class ElasticAssuranceOrchestrator:
                     }
                 },
             )
+            from proofshield.services.evidence_snapshot import persist_diagnosis
+            persist_diagnosis(self.store, result, report)
             return result, report
 
         # Retrieval succeeded, run deterministic evaluation
-        eval_result = self.assurance_engine.evaluate_run(
-            run_id=run_id,
-            strict_attribution=strict_attribution,
-        )
-
+        from proofshield.services.evidence_snapshot import persist_diagnosis
+        with self.store.transaction():
+            eval_result = self.assurance_engine.evaluate_run(run_id=run_id, strict_attribution=strict_attribution,
+                                                           collection_report=report.model_dump(mode="json"))
+            persist_diagnosis(self.store, eval_result, report)
         return eval_result, report
 
     def _ingest_telemetry_bounded(
@@ -307,6 +311,9 @@ class ElasticAssuranceOrchestrator:
                 return
 
             raw_events = self.client.map_hits_to_raw_telemetry(batch.hits)
+            from proofshield.services.canonical import compute_canonical_hash
+            for raw_ev in raw_events:
+                compute_canonical_hash(raw_ev)
             raw_persisted = 0
             raw_dups = 0
 
@@ -317,14 +324,19 @@ class ElasticAssuranceOrchestrator:
             for raw_ev in raw_events:
                 existing = self.store.get_raw_event(raw_ev.raw_event_id)
                 if existing is not None:
+                    if existing.raw_payload != raw_ev.raw_payload or existing.source_timestamp != raw_ev.source_timestamp:
+                        raise ValueError("Conflicting contents for an existing raw evidence identifier")
                     raw_dups += 1
+                    raw_ev = existing
                 else:
                     self.store.add_raw_event(raw_ev)
                     raw_persisted += 1
 
                 if normalize_telemetry:
                     try:
-                        norm_ev = self.normaliser.normalize(raw_ev)
+                        previous = next((item for item in self.store.list_normalized_events()
+                                         if item.raw_event_id == raw_ev.raw_event_id), None) if existing is not None else None
+                        norm_ev = previous or self.normaliser.normalize(raw_ev)
                         norm_events_to_persist.append(norm_ev)
                         norm_successes += 1
                     except Exception as n_err:
@@ -352,6 +364,7 @@ class ElasticAssuranceOrchestrator:
 
             norm_persisted = 0
             for norm_ev in norm_events_to_persist:
+                compute_canonical_hash(norm_ev)
                 existing_norm = self.store.get_normalized_event(norm_ev.normalized_event_id)
                 if existing_norm is None:
                     self.store.add_normalized_event(norm_ev)
@@ -396,6 +409,9 @@ class ElasticAssuranceOrchestrator:
                     raise_on_truncation=self.settings.raise_on_truncation,
                     batch_size=self.settings.batch_size,
                 )
+                from proofshield.services.canonical import compute_canonical_hash
+                for alert in alerts:
+                    compute_canonical_hash(alert)
 
                 if self.client.last_search_truncated:
                     report.alerts_status = "TRUNCATED"
@@ -412,6 +428,8 @@ class ElasticAssuranceOrchestrator:
                 for alert in alerts:
                     existing = self.store.get_alert(alert.alert_id)
                     if existing is not None:
+                        if existing.model_dump(exclude={"ingested_at"}) != alert.model_dump(exclude={"ingested_at"}):
+                            raise ValueError("Conflicting contents for an existing alert identifier")
                         alert_dups += 1
                     else:
                         self.store.add_alert(alert)

@@ -1342,8 +1342,8 @@ def test_undated_alert_without_token_does_not_make_run_inconclusive(base_setup):
         execution_token=None,
     )
     store.add_alert(undated_alert)
-    # Ensure ingested_at is explicitly None (override store default timestamp)
-    undated_alert.ingested_at = None
+    # Ensure the stored copy is explicitly undated; store APIs isolate callers.
+    store._alerts[undated_alert.alert_id].ingested_at = None
 
     # Test run where expected detection rule was silent (did not trigger)
     run = TestRunV1(

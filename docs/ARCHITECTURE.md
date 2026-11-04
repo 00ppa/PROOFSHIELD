@@ -243,7 +243,7 @@ stateDiagram-v2
 ### 3. Evidence Integrity & Canonicalization
 
 Implemented in `src/proofshield/services/canonical.py`:
-- **RFC 8785 Canonical JSON (JCS)**: Full conformance with RFC 8785 / ECMAScript 7.1.12.1 in pure Python without extra dependencies. Implements ECMAScript float-to-string conversion (e.g. `1.0` -> `1`, `-0.0` -> `0`, `1e20` -> `100000000000000000000`), UTF-16 code-unit property sorting (e.g. astral characters like `\U0001D11E` sorted before `\uFFFF`), character escaping, and strict rejection of NaN and Infinity. Cross-validated against Node.js reference engine.
+- **RFC 8785-compatible Canonical JSON (JCS)**: The JSON-compatible evidence path is regression-tested against published number, sorting, escaping, and surrogate vectors and independently compared with the Node.js number formatter. Application-only conversions for datetime, set, and Pydantic values are performed before canonical JSON serialization and are outside RFC 8785’s native JSON data model.
 - **Canonical SHA-256**: Generates SHA-256 digests over canonical UTF-8 bytes of scenarios, test runs, normalized telemetry events, alerts, ground truth records, and execution configuration.
 - **Evidence Content Binding**: In `src/proofshield/schemas/campaign.py`, `ScenarioEvidenceRefV1` and `EvidenceManifestV1` bind the full cryptographic SHA-256 content hashes of every normalized event (`telemetry_event_hashes`), alert (`alert_hashes`), ground truth (`ground_truth_hash`), and configuration (`execution_config_hash`).
 - **Integrity Scope & Threat Model**:
@@ -341,3 +341,33 @@ All benchmark suites (`tests/test_benchmark.py` BM-01 to BM-25 and `tests/test_f
 1. **No Live SOC Adoption Claim**: PROOFSHIELD has been developed and evaluated locally against synthetic and emulated datasets. It does not currently claim deployment or validation across active production commercial Security Operations Centers (SOCs).
 2. **Provenance vs. Cryptographic Proof**: Execution-token attribution provides strong execution provenance and correlation safeguards. It does **not** claim cryptographic non-repudiation or formal philosophical causality (e.g., in the Pearl/counterfactual sense).
 3. **Pluggable Storage Boundary**: PROOFSHIELD provides dual first-class storage backends: fast `InMemoryStore` for ephemeral unit testing and production-grade local `SQLiteStore` (with WAL mode, foreign keys, and indexes) for persistent multi-run workflows. Distributed cloud storage (e.g., PostgreSQL or CockroachDB) represents future enterprise clustering.
+
+## Integrated Phase 20–24 Architecture
+
+The completed extension preserves the original deterministic core while adding controlled execution, a second SIEM connector, research tooling, explanations, reports, and a connected local UI:
+
+```text
+Approved Execution Profiles
+          |
+ExecutionEvidenceV1 + SHA-256 integrity
+          |
+    +-----+------------------+
+    |                        |
+Elasticsearch            Splunk REST export
+    |                        |
+    +-----+------------------+
+          |
+RawTelemetryEventV1 -> NormalisationEngine -> NormalizedTelemetryEventV1
+          |                                      |
+          +--------------> AssuranceEngine <-----+---- AlertV1
+                                  |
+                       DiagnosticResultV1
+                         /       |       \
+              Evidence report  Explanation  Research dataset
+                         |
+                  Analyst UI / CSV export
+```
+
+`AssuranceEngine` remains the only diagnostic authority. The research models
+produce predictions and anomaly scores, and the explanation service produces
+fact/hypothesis-separated prose; neither can modify a diagnostic result.

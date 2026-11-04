@@ -24,11 +24,13 @@ from proofshield.schemas.assurance_report import CampaignAssuranceReportV1
 from proofshield.schemas.campaign import CampaignDefinitionV1, CampaignRunV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
+from proofshield.schemas.execution import ExecutionEvidenceV1
+from proofshield.schemas.explanation import AnalystExplanationV1
 from proofshield.schemas.ground_truth import GroundTruthV1
 from proofshield.schemas.scenario import ScenarioV1
 from proofshield.schemas.telemetry import NormalizedTelemetryEventV1, RawTelemetryEventV1
 from proofshield.schemas.test_run import TestRunV1
-from proofshield.services.store import hosts_match
+from proofshield.services.store import _readonly_model, hosts_match
 
 
 def serialize_timestamp(ts: Optional[datetime]) -> Optional[str]:
@@ -451,7 +453,63 @@ class SQLiteStore:
                 "CREATE INDEX IF NOT EXISTS idx_campaign_assurance_reports_generated ON campaign_assurance_reports(generated_at);"
             )
 
-            # 12. Verify physical schema integrity across all core tables
+            # 12. Executions
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS executions (
+                    execution_id TEXT PRIMARY KEY,
+                    scenario_id TEXT,
+                    test_run_id TEXT,
+                    campaign_id TEXT,
+                    execution_token TEXT NOT NULL,
+                    action_id TEXT NOT NULL,
+                    action_version TEXT NOT NULL,
+                    target_host TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    duration_seconds REAL NOT NULL,
+                    exit_code INTEGER,
+                    timed_out INTEGER NOT NULL,
+                    cleanup_status TEXT NOT NULL,
+                    integrity_hash TEXT,
+                    payload_json TEXT NOT NULL
+                );
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_executions_scenario ON executions(scenario_id);"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_executions_test_run ON executions(test_run_id);"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_executions_token ON executions(execution_token);"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_executions_started ON executions(started_at);"
+            )
+
+            # 14. Evidence-grounded analyst explanations
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS analyst_explanations (
+                    explanation_id TEXT PRIMARY KEY,
+                    diagnostic_id TEXT NOT NULL,
+                    test_run_id TEXT NOT NULL,
+                    scenario_id TEXT NOT NULL,
+                    deterministic_category TEXT NOT NULL,
+                    generated_at TEXT NOT NULL,
+                    explanation_hash TEXT,
+                    payload_json TEXT NOT NULL
+                );
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_explanations_run ON analyst_explanations(test_run_id);"
+            )
+
+            # 15. Verify physical schema integrity across all core tables
             required_columns = {
                 "scenarios": {"scenario_id", "name", "mitre_technique_id", "payload_json"},
                 "test_runs": {"run_id", "scenario_id", "execution_mode", "payload_json"},
@@ -464,6 +522,8 @@ class SQLiteStore:
                 "campaigns": {"campaign_id", "name", "created_at", "payload_json"},
                 "campaign_runs": {"run_id", "campaign_id", "status", "is_replay", "started_at", "payload_json"},
                 "campaign_assurance_reports": {"report_id", "run_id", "campaign_id", "report_digest", "generated_at", "is_complete", "payload_json"},
+                "executions": {"execution_id", "execution_token", "action_id", "status", "payload_json"},
+                "analyst_explanations": {"explanation_id", "diagnostic_id", "test_run_id", "payload_json"},
             }
             for tbl, expected_cols in required_columns.items():
                 cursor.execute(f"PRAGMA table_info({tbl});")
@@ -524,6 +584,8 @@ class SQLiteStore:
             cursor.execute("DELETE FROM campaigns;")
             cursor.execute("DELETE FROM ground_truths;")
             cursor.execute("DELETE FROM diagnostic_results;")
+            cursor.execute("DELETE FROM analyst_explanations;")
+            cursor.execute("DELETE FROM executions;")
             cursor.execute("DELETE FROM alerts;")
             cursor.execute("DELETE FROM detection_rules;")
             cursor.execute("DELETE FROM normalized_telemetry;")
@@ -859,13 +921,14 @@ class SQLiteStore:
                 cur.close()
 
     def get_events_for_run(
-        self, run: TestRunV1
+        self, run: TestRunV1, copy: bool = True
     ) -> List[NormalizedTelemetryEventV1]:
         """Correlate normalized events to a test run by host and time window.
 
         Retrieves candidate events and evaluates hosts_match() and time window
         in Python to ensure 100% deterministic parity with InMemoryStore.
-        Results are sorted chronologically and deterministically.
+        Results are sorted chronologically and deterministically. ``copy=False``
+        returns isolated evaluation snapshots.
         """
         all_events = self.list_normalized_events()
         matched = []
@@ -875,13 +938,19 @@ class SQLiteStore:
             if _is_in_window(event.normalized_timestamp, run.window_start, run.window_end):
                 matched.append(event)
 
-        return sorted(
+        ordered = sorted(
             matched,
             key=lambda e: (
                 e.normalized_timestamp or datetime.min.replace(tzinfo=timezone.utc),
                 e.normalized_event_id,
             ),
         )
+        if copy:
+            return ordered
+        return [
+            _readonly_model(event, ("hashes", "extra_attributes"))
+            for event in ordered
+        ]
 
     # ── Detection Rules ───────────────────────────────────────────────────
 
@@ -941,26 +1010,27 @@ class SQLiteStore:
     def add_alert(self, alert: AlertV1) -> AlertV1:
         """Store an alert with token extraction. Raises ValueError on duplicate ID."""
         self._check_open()
+        stored = alert.model_copy(deep=True)
         try:
             with self.transaction() as cur:
-                cur.execute("SELECT 1 FROM alerts WHERE alert_id = ?;", (alert.alert_id,))
+                cur.execute("SELECT 1 FROM alerts WHERE alert_id = ?;", (stored.alert_id,))
                 if cur.fetchone() is not None:
-                    raise ValueError(f"Alert already exists: {alert.alert_id}")
+                    raise ValueError(f"Alert already exists: {stored.alert_id}")
 
-                if alert.ingested_at is None:
-                    alert.ingested_at = datetime.now(timezone.utc)
-                if alert.alert_timestamp is None:
-                    alert.metadata["ingestion_time_only"] = True
+                if stored.ingested_at is None:
+                    stored.ingested_at = datetime.now(timezone.utc)
+                if stored.alert_timestamp is None:
+                    stored.metadata["ingestion_time_only"] = True
 
                 # Structured-first token extraction / conflict verification on alert
                 token = extract_execution_token(
-                    payload=alert.metadata,
-                    explicit_token=alert.execution_token,
-                    text_fields=[alert.alert_title],
+                    payload=stored.metadata,
+                    explicit_token=stored.execution_token,
+                    text_fields=[stored.alert_title],
                 )
-                alert.execution_token = token
+                stored.execution_token = token
 
-                payload_json = alert.model_dump_json(by_alias=True)
+                payload_json = stored.model_dump_json(by_alias=True)
                 cur.execute(
                     """
                     INSERT INTO alerts (
@@ -970,23 +1040,23 @@ class SQLiteStore:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     (
-                        alert.alert_id,
-                        alert.source_alert_id,
-                        alert.source_type,
-                        serialize_timestamp(alert.alert_timestamp),
-                        serialize_timestamp(alert.ingested_at),
-                        alert.host_id,
-                        alert.rule_reference,
-                        alert.alert_title,
-                        alert.execution_token,
+                        stored.alert_id,
+                        stored.source_alert_id,
+                        stored.source_type,
+                        serialize_timestamp(stored.alert_timestamp),
+                        serialize_timestamp(stored.ingested_at),
+                        stored.host_id,
+                        stored.rule_reference,
+                        stored.alert_title,
+                        stored.execution_token,
                         payload_json,
                     ),
                 )
         except sqlite3.IntegrityError as e:
             if "unique" in str(e).lower() or "primary key" in str(e).lower():
-                raise ValueError(f"Alert already exists: {alert.alert_id}") from e
+                raise ValueError(f"Alert already exists: {stored.alert_id}") from e
             raise
-        return alert
+        return stored.model_copy(deep=True)
 
     def get_alert(self, alert_id: str) -> Optional[AlertV1]:
         with self._lock:
@@ -1014,8 +1084,12 @@ class SQLiteStore:
         rule_id: str,
         window_start: Optional[datetime] = None,
         window_end: Optional[datetime] = None,
+        copy: bool = True,
     ) -> List[AlertV1]:
-        """Return alerts referencing a given rule ID, optionally bounded by time."""
+        """Return alerts, optionally bounded by time.
+
+        ``copy=False`` returns isolated evaluation snapshots.
+        """
         with self._lock:
             self._check_open()
             cur = self.connection.cursor()
@@ -1036,20 +1110,24 @@ class SQLiteStore:
             if _matches_rule_window(a.alert_timestamp, window_start, window_end):
                 matched.append(a)
 
-        return sorted(
+        ordered = sorted(
             matched,
             key=lambda a: (
                 a.alert_timestamp or datetime.min.replace(tzinfo=timezone.utc),
                 a.alert_id,
             ),
         )
+        if copy:
+            return ordered
+        return [_readonly_model(alert, ("metadata",)) for alert in ordered]
 
-    def get_alerts_for_run(self, run: TestRunV1) -> List[AlertV1]:
+    def get_alerts_for_run(self, run: TestRunV1, copy: bool = True) -> List[AlertV1]:
         """Correlate alerts to a test run by host and time window.
 
         Retrieves candidate alerts and evaluates hosts_match() and time window
         in Python to ensure 100% deterministic parity with InMemoryStore.
-        Results are sorted chronologically and deterministically.
+        Results are sorted chronologically and deterministically. ``copy=False``
+        returns isolated evaluation snapshots.
         """
         all_alerts = self.list_alerts()
         matched = []
@@ -1059,13 +1137,16 @@ class SQLiteStore:
             if _is_in_window(alert.alert_timestamp, run.window_start, run.window_end):
                 matched.append(alert)
 
-        return sorted(
+        ordered = sorted(
             matched,
             key=lambda a: (
                 a.alert_timestamp or datetime.min.replace(tzinfo=timezone.utc),
                 a.alert_id,
             ),
         )
+        if copy:
+            return ordered
+        return [_readonly_model(alert, ("metadata",)) for alert in ordered]
 
     # ── Diagnostic Results ────────────────────────────────────────────────
 
@@ -1422,5 +1503,170 @@ class SQLiteStore:
 
                 cursor.execute(query, tuple(params))
                 return [CampaignAssuranceReportV1.model_validate_json(r[0]) for r in cursor.fetchall()]
+            finally:
+                cursor.close()
+
+    # ── Execution Records ──────────────────────────────────────────────────
+
+    def add_execution(self, execution: ExecutionEvidenceV1) -> ExecutionEvidenceV1:
+        """Store an execution evidence record. Raises ValueError on duplicate ID."""
+        self._check_open()
+        try:
+            with self.transaction() as cur:
+                cur.execute("SELECT 1 FROM executions WHERE execution_id = ?;", (execution.execution_id,))
+                if cur.fetchone() is not None:
+                    raise ValueError(f"Execution record already exists: {execution.execution_id}")
+
+                payload_json = execution.model_dump_json(by_alias=True)
+                cur.execute(
+                    """
+                    INSERT INTO executions (
+                        execution_id, scenario_id, test_run_id, campaign_id,
+                        execution_token, action_id, action_version, target_host,
+                        status, started_at, completed_at, duration_seconds,
+                        exit_code, timed_out, cleanup_status, integrity_hash, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        execution.execution_id,
+                        execution.scenario_id,
+                        execution.test_run_id,
+                        execution.campaign_id,
+                        execution.execution_token,
+                        execution.action_id,
+                        execution.action_version,
+                        execution.target_host,
+                        execution.status.value if hasattr(execution.status, "value") else str(execution.status),
+                        serialize_timestamp(execution.started_at),
+                        serialize_timestamp(execution.completed_at),
+                        execution.duration_seconds,
+                        execution.exit_code,
+                        1 if execution.timed_out else 0,
+                        execution.cleanup_status,
+                        execution.integrity_hash,
+                        payload_json,
+                    ),
+                )
+            return execution
+        except sqlite3.IntegrityError as exc:
+            err_msg = str(exc).lower()
+            if "unique" in err_msg or "primary key" in err_msg:
+                raise ValueError(f"Execution record already exists: {execution.execution_id}") from exc
+            raise
+
+    def get_execution(self, execution_id: str) -> Optional[ExecutionEvidenceV1]:
+        """Retrieve an execution evidence record by its identifier."""
+        with self._lock:
+            self._check_open()
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    "SELECT payload_json FROM executions WHERE execution_id = ?;",
+                    (execution_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return ExecutionEvidenceV1.model_validate_json(row[0])
+            finally:
+                cursor.close()
+
+    def list_executions(
+        self,
+        scenario_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[ExecutionEvidenceV1]:
+        """List execution evidence records, optionally filtered."""
+        with self._lock:
+            self._check_open()
+            cursor = self.connection.cursor()
+            try:
+                query = "SELECT payload_json FROM executions"
+                params: List[Any] = []
+                conditions: List[str] = []
+
+                if scenario_id is not None:
+                    conditions.append("scenario_id = ?")
+                    params.append(scenario_id)
+                if run_id is not None:
+                    conditions.append("test_run_id = ?")
+                    params.append(run_id)
+                if status is not None:
+                    status_str = status.value if hasattr(status, "value") else str(status)
+                    conditions.append("status = ?")
+                    params.append(status_str)
+
+                if conditions:
+                    query += " WHERE " + " AND ".join(conditions)
+
+                query += " ORDER BY started_at ASC;"
+
+                cursor.execute(query, tuple(params))
+                return [ExecutionEvidenceV1.model_validate_json(r[0]) for r in cursor.fetchall()]
+            finally:
+                cursor.close()
+
+    # ── Analyst Explanations ───────────────────────────────────────────────
+
+    def add_explanation(self, explanation: AnalystExplanationV1) -> AnalystExplanationV1:
+        self._check_open()
+        try:
+            with self.transaction() as cur:
+                cur.execute(
+                    "SELECT 1 FROM analyst_explanations WHERE explanation_id = ?;",
+                    (explanation.explanation_id,),
+                )
+                if cur.fetchone() is not None:
+                    raise ValueError(f"Explanation already exists: {explanation.explanation_id}")
+                cur.execute(
+                    """
+                    INSERT INTO analyst_explanations (
+                        explanation_id, diagnostic_id, test_run_id, scenario_id,
+                        deterministic_category, generated_at, explanation_hash, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        explanation.explanation_id,
+                        explanation.diagnostic_id,
+                        explanation.test_run_id,
+                        explanation.scenario_id,
+                        explanation.deterministic_category.value,
+                        serialize_timestamp(explanation.generated_at),
+                        explanation.explanation_hash,
+                        explanation.model_dump_json(by_alias=True),
+                    ),
+                )
+            return explanation
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"Explanation already exists: {explanation.explanation_id}") from exc
+
+    def get_explanation(self, explanation_id: str) -> Optional[AnalystExplanationV1]:
+        with self._lock:
+            self._check_open()
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(
+                    "SELECT payload_json FROM analyst_explanations WHERE explanation_id = ?;",
+                    (explanation_id,),
+                )
+                row = cursor.fetchone()
+                return AnalystExplanationV1.model_validate_json(row[0]) if row else None
+            finally:
+                cursor.close()
+
+    def list_explanations(self, run_id: Optional[str] = None) -> List[AnalystExplanationV1]:
+        with self._lock:
+            self._check_open()
+            cursor = self.connection.cursor()
+            try:
+                if run_id is None:
+                    cursor.execute("SELECT payload_json FROM analyst_explanations ORDER BY generated_at ASC;")
+                else:
+                    cursor.execute(
+                        "SELECT payload_json FROM analyst_explanations WHERE test_run_id = ? ORDER BY generated_at ASC;",
+                        (run_id,),
+                    )
+                return [AnalystExplanationV1.model_validate_json(row[0]) for row in cursor.fetchall()]
             finally:
                 cursor.close()

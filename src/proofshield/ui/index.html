@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ProofShield • Detection assurance</title><link rel="stylesheet" href="/ui/assets/style.css"></head>
+<body><header><h1>ProofShield</h1><p>Detection assurance • evidence first</p></header>
+<main>
+<section><h2>Connection & access</h2><p>SIEM URLs and credentials are configured on the server. Tokens below stay in this page's memory.</p>
+<label>API bearer token <input id="apiToken" type="password" autocomplete="off"></label>
+<label>Execution bearer token <input id="executionToken" type="password" autocomplete="off"></label>
+<label>Telemetry source <select id="source"><option value="elastic">Elasticsearch</option><option value="splunk">Splunk</option></select></label>
+<button id="status">Check configuration</button><button id="refresh">Refresh inventory</button><button id="clear">Clear tokens</button></section>
+<section><h2>Define reviewed scenario and expectations</h2><p>Use independent expectations; creating a scenario does not create observed telemetry.</p>
+<label>Scenario JSON<textarea id="scenario" rows="9">{"scenario_id":"SCN-LOCAL-001","name":"Benign process telemetry","mitre_technique_id":"T1082","mitre_tactic":"Discovery","expected_event_category":"PROCESS_CREATION","expected_process_name":"whoami.exe","validation_target":"EXPECTED_TELEMETRY_ONLY"}</textarea></label>
+<button id="createScenario">Create scenario</button>
+<details><summary>Detection rule (for EXPECTED_ALERT scenarios)</summary><textarea id="rule" rows="5" placeholder="Paste a DetectionRuleV1 JSON object from /docs"></textarea><button id="createRule">Create rule</button></details></section>
+<section><h2>Controlled local execution</h2><p>Only reviewed allowlisted profiles execute. The host is this server, not a remote target.</p>
+<label>Scenario ID<input id="scenarioId" value="SCN-LOCAL-001"></label>
+<label>Approved profile<select id="profile"><option>whoami</option><option>hostname</option><option>python_version</option><option>echo</option></select></label>
+<button id="actions">Discover actions</button><button id="validate">Validate</button><button id="execute">Execute & record</button>
+<p>Save independent ground truth for the resulting run before collecting/evaluating evidence below.</p>
+<label>Run ID<input id="runId" placeholder="Returned by execution"></label>
+<label>Independent label<select id="label"><option>PASS</option><option>TEST_NOT_EXECUTED</option><option>EXPECTED_TELEMETRY_MISSING</option><option>DETECTION_NOT_TRIGGERED</option><option>ALERT_NOT_CORRELATED</option><option>INCONCLUSIVE</option><option>ERROR</option></select></label>
+<label>Verification method<input id="verification" placeholder="Independent observation or fault injection record"></label>
+<label>Verification evidence reference<input id="verificationEvidence" placeholder="Operator-authored evidence reference"></label>
+<button id="groundTruth">Save independent label</button></section>
+<section><h2>Evidence, diagnosis & report</h2><p>Collection always requests strict attribution. A successful process exit alone is not PASS.</p>
+<button id="collect">Collect & diagnose</button><button id="evaluate">Evaluate stored evidence (strict)</button>
+<button id="explain">Explain</button><button id="report">Build evidence report</button><button id="export">Download JSON evidence bundle</button><button id="csv">Download CSV summary</button>
+<button id="evidence">Inspect evidence</button><button id="history">Execution history</button>
+<label>Active execution ID<input id="executionId" placeholder="EXEC-..."></label><button id="cancel">Cancel active execution</button></section>
+<section><h2>Research</h2><p>Post-observation classification, independent labels, scenario-grouped held-out splits. Predictions never modify diagnoses.</p>
+<label><input type="checkbox" id="synthetic"> Explicitly include synthetic observations</label><button id="dataset">Export dataset</button><button id="research">Evaluate local baselines</button></section>
+<section><h2>Response</h2><p id="state" role="status">Ready</p><pre id="output" tabindex="0">No evidence loaded.</pre></section>
+</main><script src="/ui/assets/app.js" defer></script></body></html>

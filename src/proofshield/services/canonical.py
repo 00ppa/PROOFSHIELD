@@ -1,7 +1,8 @@
 """RFC 8785 (JSON Canonicalization Scheme - JCS) serialization and hashing.
 
-Provides deterministic canonical serialization and SHA-256 fingerprinting conforming
-to RFC 8785 (JCS) for auditable evidence integrity.
+Provides RFC 8785-compatible JSON serialization in a declared I-JSON domain,
+plus explicitly supported Python adapters for existing evidence contracts.
+Integers outside the safe binary64 range and non-string keys are rejected.
 
 Key Invariants:
 1. Whitespace: No whitespace outside JSON string literals (separators: comma and colon).
@@ -11,7 +12,7 @@ Key Invariants:
    - Integers serialize without decimal point or exponent (e.g. 1.0 -> "1").
    - Negative zero (-0.0) serializes as "0".
    - Exponential representations use lowercase 'e' with explicit '+' for positive exponents.
-   - Fixed decimal representation is used when exponent is in [-5, 20].
+    - Fixed decimal representation is used when exponent is in [-6, 20].
    - NaN and Infinity are strictly rejected with ValueError.
 4. String Escaping: Quotation marks, reverse solidus, and control characters (U+0000..U+001F)
    are escaped; all other Unicode characters are preserved as raw UTF-8 (RFC 8785 Section 3.2.2.2).
@@ -119,6 +120,8 @@ def canonical_jcs_serialize(val: Any, _depth: int = 0, max_depth: int = 64) -> s
         return "true" if val else "false"
 
     if isinstance(val, int):
+        if abs(val) > 9007199254740991:
+            raise ValueError("Integer outside the safe I-JSON range; encode large integers as strings")
         return str(val)
 
     if isinstance(val, float):
@@ -148,6 +151,8 @@ def canonical_jcs_serialize(val: Any, _depth: int = 0, max_depth: int = 64) -> s
         return "[" + ",".join(items) + "]"
 
     if isinstance(val, dict):
+        if any(not isinstance(key, str) for key in val):
+            raise ValueError("Canonical JSON object keys must be strings")
         # RFC 8785 Section 3.2.3: Keys compared as sequences of UTF-16 code units
         try:
             sorted_keys = sorted(val.keys(), key=lambda k: str(k).encode("utf-16-be"))
@@ -158,8 +163,7 @@ def canonical_jcs_serialize(val: Any, _depth: int = 0, max_depth: int = 64) -> s
             for k in sorted_keys
         ) + "}"
 
-    # Fallback for unrecognized types: convert to str then JSON string
-    return json.dumps(str(val), ensure_ascii=False)
+    raise ValueError(f"Unsupported canonical JSON value type: {type(val).__name__}")
 
 
 def canonical_json_bytes(obj: Any) -> bytes:

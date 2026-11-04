@@ -766,7 +766,9 @@ class NormalisationEngine:
     def __init__(self, normalisers: Optional[List[BaseNormaliser]] = None):
         if normalisers is None:
             from proofshield.normalisation.ecs import ECSNormaliser
+            from proofshield.normalisation.splunk import SplunkNormaliser
             normalisers = [
+                SplunkNormaliser(),
                 SysmonNormaliser(),
                 AuditdNormaliser(),
                 GenericEDRNormaliser(),

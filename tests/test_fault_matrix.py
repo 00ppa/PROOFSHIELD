@@ -49,6 +49,7 @@ def base_scenario(store):
         validation_target=ValidationTarget.EXPECTED_ALERT,
     )
     store.add_scenario(scn)
+    store.add_rule(DetectionRuleV1(rule_id="RULE-SIGMA-01", rule_name="Fault matrix rule", rule_format="sigma"))
     return scn
 
 

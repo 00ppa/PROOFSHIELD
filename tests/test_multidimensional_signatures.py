@@ -45,7 +45,24 @@ from proofshield.services.store import InMemoryStore
 
 @pytest.fixture
 def store() -> InMemoryStore:
-    return InMemoryStore()
+    store = InMemoryStore()
+    original_add_scenario = store.add_scenario
+
+    def add_scenario_with_declared_rule(scenario):
+        result = original_add_scenario(scenario)
+        if scenario.expected_detection_rule_id:
+            try:
+                store.add_rule(DetectionRuleV1(
+                    rule_id=scenario.expected_detection_rule_id,
+                    rule_name=f"Test rule {scenario.expected_detection_rule_id}",
+                    rule_format="sigma",
+                ))
+            except ValueError:
+                pass
+        return result
+
+    store.add_scenario = add_scenario_with_declared_rule
+    return store
 
 
 @pytest.fixture
@@ -1111,4 +1128,3 @@ def test_nested_transaction_in_memory_and_sqlite():
         # After outer transaction successfully commits:
         assert s.get_scenario("SCN-TX-1") is not None
         assert s.get_scenario("SCN-TX-2") is None
-

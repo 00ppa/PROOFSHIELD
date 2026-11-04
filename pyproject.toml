@@ -15,10 +15,6 @@ maintainers = [
     { name = "FS", email = "159800057+00ppa@users.noreply.github.com" },
 ]
 
-[project.urls]
-Homepage = "https://github.com/00ppa/PROOFSHIELD"
-Repository = "https://github.com/00ppa/PROOFSHIELD"
-Issues = "https://github.com/00ppa/PROOFSHIELD/issues"
 dependencies = [
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.28.0",
@@ -26,7 +22,15 @@ dependencies = [
     "python-dateutil>=2.9.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/00ppa/PROOFSHIELD"
+Repository = "https://github.com/00ppa/PROOFSHIELD"
+Issues = "https://github.com/00ppa/PROOFSHIELD/issues"
+
 [project.optional-dependencies]
+research = [
+    "scikit-learn>=1.5,<1.6",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -35,6 +39,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+proofshield = ["ui/*.html", "ui/*.css", "ui/*.js"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

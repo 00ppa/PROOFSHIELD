@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import math
 import re
 from typing import Any, Dict, List, Optional, Sequence, Union
-import uuid
+import hashlib
 
 import dateutil.parser
 
@@ -320,7 +320,7 @@ class ECSNormaliser(BaseNormaliser):
 
         return NormalizedTelemetryEventV1(
             schema_version="v1",
-            normalized_event_id=f"NORM-ECS-{uuid.uuid4().hex[:12].upper()}",
+            normalized_event_id="NORM-ECS-" + hashlib.sha256(raw_event.raw_event_id.encode()).hexdigest()[:24].upper(),
             raw_event_id=raw_event.raw_event_id,
             source_event_id=src_id,
             source_timestamp=src_ts,

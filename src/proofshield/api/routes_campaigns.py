@@ -164,8 +164,8 @@ def execute_campaign(
     preserves diagnostic outcomes and canonical evidence manifests, and computes
     aggregated summary metrics and root-cause groupings.
 
-    Notice: This endpoint is unauthenticated; access control must be enforced
-    at the network boundary or API gateway.
+    Deployment-wide API authentication is enforced by the application middleware
+    before this operation is reached.
     """
     store = get_store()
     engine = CampaignEngine(store)

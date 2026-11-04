@@ -12,6 +12,8 @@ from proofshield.schemas.assurance_report import CampaignAssuranceReportV1
 from proofshield.schemas.campaign import CampaignDefinitionV1, CampaignRunV1
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
+from proofshield.schemas.execution import ExecutionEvidenceV1
+from proofshield.schemas.explanation import AnalystExplanationV1
 from proofshield.schemas.ground_truth import GroundTruthV1
 from proofshield.schemas.scenario import ScenarioV1
 from proofshield.schemas.telemetry import NormalizedTelemetryEventV1, RawTelemetryEventV1
@@ -106,9 +108,9 @@ class StoreProtocol(Protocol):
         ...
 
     def get_events_for_run(
-        self, run: TestRunV1
+        self, run: TestRunV1, copy: bool = True
     ) -> List[NormalizedTelemetryEventV1]:
-        """Correlate normalized events to a test run by host and time window."""
+        """Correlate events; ``copy=False`` returns an isolated evaluation snapshot."""
         ...
 
     # ── Detection Rules ───────────────────────────────────────────────────
@@ -144,12 +146,13 @@ class StoreProtocol(Protocol):
         rule_id: str,
         window_start: Optional[datetime] = None,
         window_end: Optional[datetime] = None,
+        copy: bool = True,
     ) -> List[AlertV1]:
-        """Return alerts referencing a given rule ID, optionally bounded by time."""
+        """Return alerts; ``copy=False`` returns isolated evaluation snapshots."""
         ...
 
-    def get_alerts_for_run(self, run: TestRunV1) -> List[AlertV1]:
-        """Correlate alerts to a test run by host and time window."""
+    def get_alerts_for_run(self, run: TestRunV1, copy: bool = True) -> List[AlertV1]:
+        """Correlate alerts; ``copy=False`` returns isolated evaluation snapshots."""
         ...
 
     # ── Diagnostic Results ────────────────────────────────────────────────
@@ -168,6 +171,20 @@ class StoreProtocol(Protocol):
 
     def list_results(self) -> List[DiagnosticResultV1]:
         """List all diagnostic evaluation results."""
+        ...
+
+    # ── Analyst Explanations ───────────────────────────────────────────────
+
+    def add_explanation(self, explanation: AnalystExplanationV1) -> AnalystExplanationV1:
+        """Store an evidence-grounded explanation. Raises ValueError on duplicate ID."""
+        ...
+
+    def get_explanation(self, explanation_id: str) -> Optional[AnalystExplanationV1]:
+        """Retrieve an explanation by identifier."""
+        ...
+
+    def list_explanations(self, run_id: Optional[str] = None) -> List[AnalystExplanationV1]:
+        """List explanations, optionally filtered by test run."""
         ...
 
     # ── Ground Truth ──────────────────────────────────────────────────────
@@ -232,4 +249,23 @@ class StoreProtocol(Protocol):
         self, campaign_id: Optional[str] = None, run_id: Optional[str] = None
     ) -> List[CampaignAssuranceReportV1]:
         """List assurance reports, optionally filtered by campaign ID or run ID."""
+        ...
+
+    # ── Execution Records ──────────────────────────────────────────────────
+
+    def add_execution(self, execution: ExecutionEvidenceV1) -> ExecutionEvidenceV1:
+        """Store an execution evidence record. Raises ValueError on duplicate ID."""
+        ...
+
+    def get_execution(self, execution_id: str) -> Optional[ExecutionEvidenceV1]:
+        """Retrieve an execution evidence record by its identifier."""
+        ...
+
+    def list_executions(
+        self,
+        scenario_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[ExecutionEvidenceV1]:
+        """List execution evidence records, optionally filtered."""
         ...

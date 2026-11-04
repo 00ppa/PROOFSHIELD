@@ -42,8 +42,30 @@ from proofshield.schemas.campaign import (
 )
 from proofshield.schemas.detection_rule import DetectionRuleV1
 from proofshield.schemas.diagnosis import DiagnosticResultV1
+from proofshield.schemas.execution import (
+    ActionDescriptorV1,
+    ExecutionEvidenceV1,
+    ExecutionRequestV1,
+    ExecutionValidationResultV1,
+    RunnerExecutionState,
+)
 from proofshield.schemas.ground_truth import GroundTruthV1
+from proofshield.schemas.explanation import (
+    AnalystExplanationV1,
+    ExplanationFactV1,
+    ExplanationGapV1,
+    ExplanationHypothesisV1,
+)
+from proofshield.schemas.research import (
+    AnomalyScoreV1,
+    ClassificationMetricsV1,
+    DatasetCollectionV1,
+    DatasetObservationV1,
+    DatasetSplitV1,
+    ModelEvaluationResultV1,
+)
 from proofshield.schemas.scenario import ScenarioV1
+from proofshield.schemas.report import RunEvidenceReportV1
 from proofshield.schemas.telemetry import (
     NormalizedTelemetryEventV1,
     RawTelemetryEventV1,
@@ -70,6 +92,9 @@ from proofshield.schemas.test_run import TestRunV1
 
 __all__ = [
     "SCHEMA_VERSION",
+    "ActionDescriptorV1",
+    "AnomalyScoreV1",
+    "AnalystExplanationV1",
     "AlertV1",
     "AssuranceMetricV1",
     "AttributionStatus",
@@ -77,6 +102,7 @@ __all__ = [
     "CampaignComparisonV1",
     "CampaignCompatibilityV1",
     "CampaignDefinitionV1",
+    "ClassificationMetricsV1",
     "CampaignExecutionConfigV1",
     "CampaignExecutionPolicy",
     "CampaignRegressionAnalysisV1",
@@ -86,6 +112,9 @@ __all__ = [
     "CampaignSummaryV1",
     "DetectionAssuranceMetricsV1",
     "DetectionRuleV1",
+    "DatasetCollectionV1",
+    "DatasetObservationV1",
+    "DatasetSplitV1",
     "DiagnosticCategory",
     "DiagnosticDistributionV1",
     "DiagnosticOutcome",
@@ -94,9 +123,15 @@ __all__ = [
     "EvidenceManifestV1",
     "EvidenceQualityV1",
     "EvidenceVerificationStatus",
+    "ExecutionEvidenceV1",
     "ExecutionMode",
+    "ExecutionRequestV1",
     "ExecutionStatus",
     "ExecutionSummaryV1",
+    "ExecutionValidationResultV1",
+    "ExplanationFactV1",
+    "ExplanationGapV1",
+    "ExplanationHypothesisV1",
     "FailureCategory",
     "FindingCategory",
     "FindingSeverity",
@@ -104,6 +139,7 @@ __all__ = [
     "GroundTruthV1",
     "MetricStatus",
     "NormalizedTelemetryEventV1",
+    "ModelEvaluationResultV1",
     "RawTelemetryEventV1",
     "RegressionFindingV1",
     "RegressionVerdict",
@@ -111,6 +147,8 @@ __all__ = [
     "RootCauseGroupV1",
     "RootCauseIntelligenceV1",
     "RootCausePatternV1",
+    "RunnerExecutionState",
+    "RunEvidenceReportV1",
     "ScenarioCampaignResultV1",
     "ScenarioEvidenceRefV1",
     "ScenarioRegressionV1",
